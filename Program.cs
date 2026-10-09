@@ -13,11 +13,16 @@ namespace TrayWrapperApp
     {
         public string TargetPath { get; set; } = @"Z:\Prog\Library_Release\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat";
         public string Arguments { get; set; } = "";
-        public string WorkingDirectory { get; set; } = "";
+        public string WorkingDirectory { get; set; } = @"Z:\Prog\Library_Release\AutoStartPrintCenter";
         public bool HideWindow { get; set; } = true;
-        public bool AutoRestartOnCrash { get; set; } = false; // ปิดเป็น default เพื่อไม่ให้ loop ถ้าไฟล์ .bat exit เร็ว
+        public bool AutoRestartOnCrash { get; set; } = false;
         public string TrayTooltip { get; set; } = "Print Center Service";
         public string CustomIconPath { get; set; } = "";
+        
+        /// <summary>
+        /// รหัสผ่านสำหรับสั่งปิดโปรแกรม (ถ้าเว้นว่างไว้ "" จะไม่ต้องใส่รหัส)
+        /// </summary>
+        public string ExitPassword { get; set; } = "";
     }
 
     static class Program
@@ -35,12 +40,11 @@ namespace TrayWrapperApp
         [STAThread]
         static void Main()
         {
-            // 1. Single Instance Protection (รันได้ทีละ 1 ตัวเท่านั้น)
+            // 1. Single Instance Lock (รันได้ 1 ตัวเท่านั้น)
             const string appGuid = "Global\\TrayWrapperApp_SingleInstance_Guid_987123";
             mutex = new Mutex(true, appGuid, out bool isNewInstance);
             if (!isNewInstance)
             {
-                // ถ้ามีตัวเดิมเปิดอยู่แล้ว ให้ปิดตัวใหม่ทันที
                 return;
             }
 
@@ -53,7 +57,6 @@ namespace TrayWrapperApp
 
             Application.Run();
 
-            // Release Mutex
             GC.KeepAlive(mutex);
         }
 
@@ -64,7 +67,11 @@ namespace TrayWrapperApp
                 if (File.Exists(ConfigPath))
                 {
                     string json = File.ReadAllText(ConfigPath);
-                    config = JsonSerializer.Deserialize<AppConfig>(json) ?? new AppConfig();
+                    config = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
+                    {
+                        ReadCommentHandling = JsonCommentHandling.Skip,
+                        AllowTrailingCommas = true
+                    }) ?? new AppConfig();
                 }
                 else
                 {
@@ -73,9 +80,10 @@ namespace TrayWrapperApp
                     File.WriteAllText(ConfigPath, json);
                 }
             }
-            catch
+            catch (Exception ex)
             {
                 config = new AppConfig();
+                MessageBox.Show($"พบข้อผิดพลาดใน config.json: {ex.Message}\nระบบจะใช้ค่าเริ่มต้น", "Config Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
@@ -101,10 +109,10 @@ namespace TrayWrapperApp
 
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             
-            var statusItem = new ToolStripMenuItem("Tray Wrapper: Active") { Enabled = false };
-            var restartItem = new ToolStripMenuItem("🔄 Restart Target", null, (s, e) => RestartProcess());
+            var statusItem = new ToolStripMenuItem("Status: Running") { Enabled = false };
+            var restartItem = new ToolStripMenuItem("🔄 Restart Service", null, (s, e) => RestartProcess());
             var openFolderItem = new ToolStripMenuItem("📁 Open Folder", null, (s, e) => OpenTargetFolder());
-            var exitItem = new ToolStripMenuItem("❌ Exit", null, (s, e) => ExitApplication());
+            var exitItem = new ToolStripMenuItem("❌ Exit", null, (s, e) => HandleExitRequest());
 
             contextMenu.Items.Add(statusItem);
             contextMenu.Items.Add(new ToolStripSeparator());
@@ -133,6 +141,12 @@ namespace TrayWrapperApp
                     psi.FileName = "cmd.exe";
                     psi.Arguments = $"/c \"\"{target}\" {args}\"";
                 }
+                else if (ext == ".lnk")
+                {
+                    psi.FileName = target;
+                    psi.Arguments = args;
+                    psi.UseShellExecute = true;
+                }
                 else
                 {
                     psi.FileName = target;
@@ -148,16 +162,11 @@ namespace TrayWrapperApp
                     psi.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(target));
                 }
 
-                if (config.HideWindow)
+                if (config.HideWindow && ext != ".lnk")
                 {
                     psi.UseShellExecute = false;
                     psi.CreateNoWindow = true;
                     psi.WindowStyle = ProcessWindowStyle.Hidden;
-                }
-                else
-                {
-                    psi.UseShellExecute = true;
-                    psi.WindowStyle = ProcessWindowStyle.Normal;
                 }
 
                 childProcess = new Process
@@ -174,7 +183,7 @@ namespace TrayWrapperApp
 
                     var runtime = DateTime.Now - processStartTime;
 
-                    // ป้องกันลูปนรก: ถ้ารันไม่ถึง 10 วินาทีแล้วดับ หรือ Exit Code เป็น 0 (ทำงานเสร็จปกติ) จะไม่ restart ซ้ำ
+                    // ป้องกัน loop ถ้าไฟล์ทำงานเสร็จเร็ว หรือ AutoRestart เป็น false
                     if (!config.AutoRestartOnCrash || runtime.TotalSeconds < 10)
                     {
                         return;
@@ -187,7 +196,7 @@ namespace TrayWrapperApp
                     }
                     else
                     {
-                        trayIcon?.ShowBalloonTip(5000, "Tray Wrapper", "Process ดับบ่อยเกินไป จึงหยุด Auto-Restart อัตโนมัติ", ToolTipIcon.Warning);
+                        trayIcon?.ShowBalloonTip(5000, "Tray Wrapper", "Service หยุดทำงานบ่อยเกินไป จึงระงับ Auto-Restart", ToolTipIcon.Warning);
                     }
                 };
 
@@ -195,7 +204,7 @@ namespace TrayWrapperApp
             }
             catch (Exception ex)
             {
-                trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเปิดไฟล์ได้: {ex.Message}", ToolTipIcon.Error);
+                trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเปิด Process ได้: {ex.Message}", ToolTipIcon.Error);
             }
         }
 
@@ -234,6 +243,62 @@ namespace TrayWrapperApp
                 }
             }
             catch { }
+        }
+
+        private static void HandleExitRequest()
+        {
+            // ถ้ามีการตั้งรหัสผ่านไว้
+            if (!string.IsNullOrEmpty(config.ExitPassword))
+            {
+                string input = PromptPasswordDialog("กรุณากรอกรหัสผ่านเพื่อปิดโปรแกรม:", "ยืนยันการปิด Service");
+                if (input == null)
+                {
+                    // ผู้ใช้กด Cancel
+                    return;
+                }
+
+                if (input != config.ExitPassword)
+                {
+                    MessageBox.Show("รหัสผ่านไม่ถูกต้อง!", "ปฏิเสธการเข้าถึง", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+            }
+
+            // ถ้าผ่านรหัสผ่าน หรือไม่ได้ตั้งรหัสไว้
+            ExitApplication();
+        }
+
+        private static string PromptPasswordDialog(string text, string caption)
+        {
+            using (Form prompt = new Form())
+            {
+                prompt.Width = 360;
+                prompt.Height = 175;
+                prompt.FormBorderStyle = FormBorderStyle.FixedDialog;
+                prompt.Text = caption;
+                prompt.StartPosition = FormStartPosition.CenterScreen;
+                prompt.MaximizeBox = false;
+                prompt.MinimizeBox = false;
+                prompt.TopMost = true;
+
+                Label textLabel = new Label() { Left = 20, Top = 15, Text = text, AutoSize = true };
+                TextBox textBox = new TextBox() { Left = 20, Top = 45, Width = 300, PasswordChar = '●' };
+                
+                Button confirmation = new Button() { Text = "ตกลง", Left = 155, Width = 80, Top = 85, DialogResult = DialogResult.OK };
+                Button cancel = new Button() { Text = "ยกเลิก", Left = 240, Width = 80, Top = 85, DialogResult = DialogResult.Cancel };
+
+                confirmation.Click += (sender, e) => { prompt.Close(); };
+                cancel.Click += (sender, e) => { prompt.Close(); };
+
+                prompt.Controls.Add(textBox);
+                prompt.Controls.Add(confirmation);
+                prompt.Controls.Add(cancel);
+                prompt.Controls.Add(textLabel);
+                prompt.AcceptButton = confirmation;
+                prompt.CancelButton = cancel;
+
+                return prompt.ShowDialog() == DialogResult.OK ? textBox.Text : null;
+            }
         }
 
         private static void ExitApplication()
