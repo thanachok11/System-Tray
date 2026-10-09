@@ -48,11 +48,25 @@ namespace TrayWrapperApp
         [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern int GetWindowTextLength(IntPtr hWnd);
 
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnableMenuItem(IntPtr hMenu, uint uIDEnableItem, uint uEnable);
+
+        [DllImport("user32.dll")]
+        private static extern bool RemoveMenu(IntPtr hMenu, uint uPosition, uint uFlags);
+
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         private const int SW_HIDE = 0;
         private const int SW_SHOW = 5;
         private const int SW_RESTORE = 9;
+
+        private const uint SC_CLOSE = 0xF060;
+        private const uint MF_BYCOMMAND = 0x00000000;
+        private const uint MF_GRAYED = 0x00000001;
+        private const uint MF_DISABLED = 0x00000002;
         #endregion
 
         private static Mutex? mutex;
@@ -84,7 +98,7 @@ namespace TrayWrapperApp
 
             LoadConfig();
 
-            // รองรับ Drag & Drop ไฟล์มาวางบนไอคอนโปรแกรม
+            // รองรับ Drag & Drop ไฟล์มาวางบนไอคอน
             if (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
             {
                 string droppedFile = CleanPath(args[0]);
@@ -216,10 +230,9 @@ namespace TrayWrapperApp
                 Visible = true
             };
 
-            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน หน้าต่าง log ทันที
+            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน หน้าต่างทันที
             trayIcon.DoubleClick += (s, e) => ToggleTargetWindow();
 
-            // เมนูคลิกขวา
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             
             var toggleWinItem = new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง (Show/Hide)", null, (s, e) => ToggleTargetWindow());
@@ -273,7 +286,6 @@ namespace TrayWrapperApp
 
                 ProcessStartInfo psi = new ProcessStartInfo();
 
-                // ถ้ารันไฟล์ .bat / .cmd ให้รันผ่าน cmd.exe /k เพื่อให้ Console Window คงอยู่และแสดงผล log ตลอด
                 if (ext == ".bat" || ext == ".cmd")
                 {
                     psi.FileName = "cmd.exe";
@@ -336,7 +348,7 @@ namespace TrayWrapperApp
                 childProcess.Start();
                 spawnedPid = childProcess.Id;
 
-                // จับ Window Handle และสั่งซ่อนทันทีถ้าตั้งค่า HideWindow ไว้
+                // จับ Window Handle, ปิดปุ่มกากบาท [X] และสั่งซ่อนถ้าตั้งค่า HideWindow ไว้
                 Task.Run(async () =>
                 {
                     targetConsoleHwnd = IntPtr.Zero;
@@ -347,6 +359,9 @@ namespace TrayWrapperApp
                         targetConsoleHwnd = FindProcessWindow();
                         if (targetConsoleHwnd != IntPtr.Zero)
                         {
+                            // 🔒 ปิดปุ่มกากบาท [X] ทันที ป้องกัน User เผลอกดปิด
+                            DisableCloseButton(targetConsoleHwnd);
+
                             if (config.HideWindow)
                             {
                                 ShowWindow(targetConsoleHwnd, SW_HIDE);
@@ -365,6 +380,21 @@ namespace TrayWrapperApp
             {
                 trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเปิด Process ได้: {ex.Message}", ToolTipIcon.Error);
             }
+        }
+
+        private static void DisableCloseButton(IntPtr hWnd)
+        {
+            if (hWnd == IntPtr.Zero) return;
+            try
+            {
+                IntPtr hMenu = GetSystemMenu(hWnd, false);
+                if (hMenu != IntPtr.Zero)
+                {
+                    EnableMenuItem(hMenu, SC_CLOSE, MF_BYCOMMAND | MF_DISABLED | MF_GRAYED);
+                    RemoveMenu(hMenu, SC_CLOSE, MF_BYCOMMAND);
+                }
+            }
+            catch { }
         }
 
         private static IntPtr FindProcessWindow()
@@ -429,6 +459,9 @@ namespace TrayWrapperApp
                     trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "กำลังค้นหาหน้าต่าง Console หรือโปรแกรมปิดตัวไปแล้ว", ToolTipIcon.Info);
                     return;
                 }
+
+                // ล็อกปุ่ม [X] ทุกครั้งที่มีการเปิดหน้าต่าง
+                DisableCloseButton(targetConsoleHwnd);
 
                 if (isWindowCurrentlyShown && IsWindowVisible(targetConsoleHwnd))
                 {
