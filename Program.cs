@@ -117,6 +117,9 @@ namespace TrayWrapperApp
                 return;
             }
 
+            // ซ่อมแซมและเติม System PATH เผื่อตอนรันตอน Auto-Start แล้ว PATH ยังไม่สมบูรณ์
+            EnsureSystemPath();
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -163,6 +166,29 @@ namespace TrayWrapperApp
             Application.Run();
 
             GC.KeepAlive(mutex);
+        }
+
+        private static void EnsureSystemPath()
+        {
+            try
+            {
+                string sys32 = Environment.GetFolderPath(Environment.SpecialFolder.System); // C:\Windows\System32
+                string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows); // C:\Windows
+                string wbem = Path.Combine(sys32, "wbem");
+                string powershell = Path.Combine(sys32, "WindowsPowerShell", "v1.0");
+
+                string currentPath = Environment.GetEnvironmentVariable("PATH") ?? "";
+                var paths = new List<string>(currentPath.Split(';', StringSplitOptions.RemoveEmptyEntries));
+
+                if (!paths.Contains(sys32, StringComparer.OrdinalIgnoreCase)) paths.Insert(0, sys32);
+                if (!paths.Contains(winDir, StringComparer.OrdinalIgnoreCase)) paths.Insert(1, winDir);
+                if (!paths.Contains(wbem, StringComparer.OrdinalIgnoreCase)) paths.Add(wbem);
+                if (!paths.Contains(powershell, StringComparer.OrdinalIgnoreCase)) paths.Add(powershell);
+
+                string newPath = string.Join(";", paths);
+                Environment.SetEnvironmentVariable("PATH", newPath);
+            }
+            catch { }
         }
 
         private static void LoadConfig()
@@ -437,7 +463,9 @@ namespace TrayWrapperApp
 
                 if (ext == ".bat" || ext == ".cmd")
                 {
-                    psi.FileName = "cmd.exe";
+                    string sys32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                    string cmdExePath = Path.Combine(sys32, "cmd.exe");
+                    psi.FileName = File.Exists(cmdExePath) ? cmdExePath : "cmd.exe";
                     psi.Arguments = $"/k \"\"{target}\" {args}\"";
                 }
                 else if (ext == ".lnk")
