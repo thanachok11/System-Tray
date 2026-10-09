@@ -108,7 +108,7 @@ namespace TrayWrapperApp
         private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
             const string appGuid = "Global\\TrayWrapperApp_SingleInstance_Guid_987123";
             mutex = new Mutex(true, appGuid, out bool isNewInstance);
@@ -121,8 +121,44 @@ namespace TrayWrapperApp
             Application.SetCompatibleTextRenderingDefault(false);
 
             LoadConfig();
+
+            // รองรับ Drag & Drop ไฟล์มาหย่อนทับ
+            if (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
+            {
+                string droppedFile = CleanPath(args[0]);
+                if (File.Exists(droppedFile))
+                {
+                    if (managedApps.Count == 0)
+                    {
+                        var newProg = new ProgramItemConfig
+                        {
+                            Name = Path.GetFileNameWithoutExtension(droppedFile),
+                            TargetPath = droppedFile,
+                            WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(droppedFile)) ?? "",
+                            HideWindow = true
+                        };
+                        config.Programs.Add(newProg);
+                        managedApps.Add(new ManagedApp(newProg));
+                    }
+                    else
+                    {
+                        managedApps[0].Config.TargetPath = droppedFile;
+                        managedApps[0].Config.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(droppedFile)) ?? "";
+                    }
+                    SaveConfig();
+                }
+            }
+
             InitTrayIcon();
-            StartAllProcesses();
+
+            if (managedApps.Count == 0)
+            {
+                PromptAddNewProgram();
+            }
+            else
+            {
+                StartAllProcesses();
+            }
 
             Application.Run();
 
@@ -200,7 +236,7 @@ namespace TrayWrapperApp
         {
             config = new AppConfig
             {
-                TrayTooltip = "Print Center & Secondary Services",
+                TrayTooltip = "Print Center & Background Services",
                 CustomIconPath = "",
                 ExitPassword = "",
                 Programs = new List<ProgramItemConfig>
@@ -289,6 +325,7 @@ namespace TrayWrapperApp
             contextMenu.Items.Add(restartAllItem);
             contextMenu.Items.Add(new ToolStripSeparator());
 
+            // เมนูย่อยสำหรับแต่ละโปรแกรม
             for (int i = 0; i < managedApps.Count; i++)
             {
                 var app = managedApps[i];
@@ -297,15 +334,82 @@ namespace TrayWrapperApp
                 var subMenu = new ToolStripMenuItem($"⚙️ {displayName}");
                 subMenu.DropDownItems.Add(new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง", null, (s, e) => ToggleSingleAppWindow(app)));
                 subMenu.DropDownItems.Add(new ToolStripMenuItem("🔄 Restart โปรแกรมนี้", null, (s, e) => RestartSingleProcess(app)));
+                subMenu.DropDownItems.Add(new ToolStripMenuItem("🎯 เปลี่ยนไฟล์โปรแกรมนี้...", null, (s, e) => PromptChangeAppTarget(app)));
                 subMenu.DropDownItems.Add(new ToolStripMenuItem("📁 เปิดโฟลเดอร์", null, (s, e) => OpenSingleFolder(app)));
 
                 contextMenu.Items.Add(subMenu);
             }
 
             contextMenu.Items.Add(new ToolStripSeparator());
+            contextMenu.Items.Add(new ToolStripMenuItem("➕ เพิ่มโปรแกรมใหม่...", null, (s, e) => PromptAddNewProgram()));
+            contextMenu.Items.Add(new ToolStripMenuItem("📝 แก้ไข config.json", null, (s, e) => OpenConfigFile()));
+            contextMenu.Items.Add(new ToolStripSeparator());
             contextMenu.Items.Add(new ToolStripMenuItem("❌ ปิดโปรแกรมทั้งหมด (Exit)", null, (s, e) => HandleExitRequest()));
 
             trayIcon.ContextMenuStrip = contextMenu;
+        }
+
+        private static void PromptChangeAppTarget(ManagedApp app)
+        {
+            using (OpenFileDialog ofd = new OpenFileDialog())
+            {
+                ofd.Title = $"เลือกไฟล์ใหม่สำหรับ: {app.Config.Name}";
+                ofd.Filter = "Executable & Scripts (*.bat;*.cmd;*.exe;*.lnk)|*.bat;*.cmd;*.exe;*.lnk|All Files (*.*)|*.*";
+                
+                if (ofd.ShowDialog() == DialogResult.OK)
+                {
+                    app.Config.TargetPath = ofd.FileName;
+                    app.Config.WorkingDirectory = Path.GetDirectoryName(ofd.FileName) ?? "";
+                    SaveConfig();
+
+                    UpdateContextMenu();
+                    RestartSingleProcess(app);
+                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", $"เปลี่ยนไฟล์สำหรับ {app.Config.Name} สำเร็จแล้ว", ToolTipIcon.Info);
+                }
+            }
+        }
+
+        private static void PromptAddNewProgram()
+        {
+            using (OpenFileDialog ofd = new OpenFileDialog())
+            {
+                ofd.Title = "เลือกไฟล์โปรแกรม (.bat / .exe / .lnk / script) ที่ต้องการเพิ่ม";
+                ofd.Filter = "Executable & Scripts (*.bat;*.cmd;*.exe;*.lnk)|*.bat;*.cmd;*.exe;*.lnk|All Files (*.*)|*.*";
+                
+                if (ofd.ShowDialog() == DialogResult.OK)
+                {
+                    var newConfig = new ProgramItemConfig
+                    {
+                        Name = Path.GetFileNameWithoutExtension(ofd.FileName),
+                        TargetPath = ofd.FileName,
+                        WorkingDirectory = Path.GetDirectoryName(ofd.FileName) ?? "",
+                        HideWindow = true,
+                        AutoRestartOnCrash = false
+                    };
+
+                    config.Programs.Add(newConfig);
+                    SaveConfig();
+
+                    var newApp = new ManagedApp(newConfig);
+                    managedApps.Add(newApp);
+
+                    UpdateContextMenu();
+                    StartSingleProcess(newApp);
+                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", $"เพิ่มโปรแกรม {newConfig.Name} เรียบร้อยแล้ว", ToolTipIcon.Info);
+                }
+            }
+        }
+
+        private static void OpenConfigFile()
+        {
+            try
+            {
+                if (File.Exists(ConfigPath))
+                {
+                    Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = $"\"{ConfigPath}\"", UseShellExecute = true });
+                }
+            }
+            catch { }
         }
 
         private static void StartAllProcesses()
@@ -357,7 +461,6 @@ namespace TrayWrapperApp
                     psi.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(target)) ?? "";
                 }
 
-                // สั่งซ่อนจากตอนสร้าง process ทันที เพื่อไม่ให้มี icon โผล่ขึ้นมาบน Taskbar ตั้งแต่เริ่มต้น
                 if (app.Config.HideWindow && ext != ".lnk")
                 {
                     psi.UseShellExecute = false;
@@ -402,7 +505,6 @@ namespace TrayWrapperApp
                 app.ChildProcess.Start();
                 app.SpawnedPid = app.ChildProcess.Id;
 
-                // ตรวจหา Window Handle, ปิดปุ่ม [X] และยืนยันการซ่อนออกจาก Taskbar
                 Task.Run(async () =>
                 {
                     app.WindowHandle = IntPtr.Zero;
