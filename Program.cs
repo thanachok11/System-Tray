@@ -14,12 +14,12 @@ namespace TrayWrapperApp
 {
     public class AppConfig
     {
-        public string TargetPath { get; set; } = "";
+        public string TargetPath { get; set; } = @"C:\appsoft\bin\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat";
         public string Arguments { get; set; } = "";
         public string WorkingDirectory { get; set; } = "";
-        public bool HideWindow { get; set; } = false;
+        public bool HideWindow { get; set; } = true;
         public bool AutoRestartOnCrash { get; set; } = false;
-        public string TrayTooltip { get; set; } = "Tray Wrapper Service";
+        public string TrayTooltip { get; set; } = "Print Center Service";
         public string CustomIconPath { get; set; } = "";
         public string ExitPassword { get; set; } = "";
     }
@@ -58,11 +58,12 @@ namespace TrayWrapperApp
         private static Mutex? mutex;
         private static NotifyIcon? trayIcon;
         private static Process? childProcess;
+        private static IntPtr targetConsoleHwnd = IntPtr.Zero;
         private static AppConfig config = new AppConfig();
         private static bool isManualExit = false;
         private static DateTime processStartTime;
         private static int crashCount = 0;
-        private static bool isWindowCurrentlyShown = true;
+        private static bool isWindowCurrentlyShown = false;
         private static int spawnedPid = 0;
 
         private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
@@ -83,7 +84,7 @@ namespace TrayWrapperApp
 
             LoadConfig();
 
-            // 1. ถ้ารองรับ Drag & Drop ไฟล์มาวางบนไอคอน .exe ให้จำค่านั้นทันที
+            // รองรับ Drag & Drop ไฟล์มาวางบนไอคอนโปรแกรม
             if (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
             {
                 string droppedFile = CleanPath(args[0]);
@@ -97,7 +98,6 @@ namespace TrayWrapperApp
 
             InitTrayIcon();
 
-            // 2. ถ้ายังไม่มี target ให้เด้งถามเลือกไฟล์
             if (string.IsNullOrWhiteSpace(config.TargetPath) || !File.Exists(config.TargetPath))
             {
                 PromptSelectTargetFile();
@@ -171,10 +171,10 @@ namespace TrayWrapperApp
             cfg.TargetPath = ExtractValue("TargetPath") ?? cfg.TargetPath;
             cfg.Arguments = ExtractValue("Arguments") ?? "";
             cfg.WorkingDirectory = ExtractValue("WorkingDirectory") ?? "";
-            cfg.TrayTooltip = ExtractValue("TrayTooltip") ?? "Tray Wrapper Service";
+            cfg.TrayTooltip = ExtractValue("TrayTooltip") ?? "Print Center Service";
             cfg.CustomIconPath = ExtractValue("CustomIconPath") ?? "";
             cfg.ExitPassword = ExtractValue("ExitPassword") ?? "";
-            cfg.HideWindow = ExtractBool("HideWindow", false);
+            cfg.HideWindow = ExtractBool("HideWindow", true);
             cfg.AutoRestartOnCrash = ExtractBool("AutoRestartOnCrash", false);
 
             return cfg;
@@ -216,9 +216,10 @@ namespace TrayWrapperApp
                 Visible = true
             };
 
-            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน หน้าต่าง
+            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน หน้าต่าง log ทันที
             trayIcon.DoubleClick += (s, e) => ToggleTargetWindow();
 
+            // เมนูคลิกขวา
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             
             var toggleWinItem = new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง (Show/Hide)", null, (s, e) => ToggleTargetWindow());
@@ -251,7 +252,6 @@ namespace TrayWrapperApp
                     config.WorkingDirectory = Path.GetDirectoryName(ofd.FileName) ?? "";
                     SaveConfig();
 
-                    // อัปเดตไอคอน
                     InitTrayIcon();
                     RestartProcess();
                 }
@@ -273,10 +273,11 @@ namespace TrayWrapperApp
 
                 ProcessStartInfo psi = new ProcessStartInfo();
 
+                // ถ้ารันไฟล์ .bat / .cmd ให้รันผ่าน cmd.exe /k เพื่อให้ Console Window คงอยู่และแสดงผล log ตลอด
                 if (ext == ".bat" || ext == ".cmd")
                 {
                     psi.FileName = "cmd.exe";
-                    psi.Arguments = $"/c \"\"{target}\" {args}\"";
+                    psi.Arguments = $"/k \"\"{target}\" {args}\"";
                 }
                 else if (ext == ".lnk")
                 {
@@ -299,16 +300,8 @@ namespace TrayWrapperApp
                     psi.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(target)) ?? "";
                 }
 
-                if (config.HideWindow && ext != ".lnk")
-                {
-                    psi.UseShellExecute = false;
-                    psi.WindowStyle = ProcessWindowStyle.Hidden;
-                }
-                else
-                {
-                    psi.UseShellExecute = true;
-                    psi.WindowStyle = ProcessWindowStyle.Normal;
-                }
+                psi.UseShellExecute = true;
+                psi.WindowStyle = ProcessWindowStyle.Normal;
 
                 childProcess = new Process
                 {
@@ -317,7 +310,6 @@ namespace TrayWrapperApp
                 };
 
                 processStartTime = DateTime.Now;
-                isWindowCurrentlyShown = !config.HideWindow;
 
                 childProcess.Exited += (s, e) =>
                 {
@@ -344,24 +336,30 @@ namespace TrayWrapperApp
                 childProcess.Start();
                 spawnedPid = childProcess.Id;
 
-                // ถ้าตั้งซ่อนหน้าต่างไว้ ให้รอหาหน้าต่างแล้วสั่งซ่อน
-                if (config.HideWindow)
+                // จับ Window Handle และสั่งซ่อนทันทีถ้าตั้งค่า HideWindow ไว้
+                Task.Run(async () =>
                 {
-                    Task.Run(async () =>
+                    targetConsoleHwnd = IntPtr.Zero;
+
+                    for (int i = 0; i < 20; i++)
                     {
-                        for (int i = 0; i < 15; i++)
+                        await Task.Delay(150);
+                        targetConsoleHwnd = FindProcessWindow();
+                        if (targetConsoleHwnd != IntPtr.Zero)
                         {
-                            await Task.Delay(300);
-                            IntPtr hWnd = FindProcessWindow();
-                            if (hWnd != IntPtr.Zero)
+                            if (config.HideWindow)
                             {
-                                ShowWindow(hWnd, SW_HIDE);
+                                ShowWindow(targetConsoleHwnd, SW_HIDE);
                                 isWindowCurrentlyShown = false;
-                                break;
                             }
+                            else
+                            {
+                                isWindowCurrentlyShown = true;
+                            }
+                            break;
                         }
-                    });
-                }
+                    }
+                });
             }
             catch (Exception ex)
             {
@@ -371,7 +369,6 @@ namespace TrayWrapperApp
 
         private static IntPtr FindProcessWindow()
         {
-            // 1) ลองหาจาก childProcess โดยตรง
             if (childProcess != null)
             {
                 try
@@ -385,7 +382,6 @@ namespace TrayWrapperApp
                 catch { }
             }
 
-            // 2) สแกนหาหน้าต่างของ Process ที่เกี่ยวข้อง หรือหน้าต่างที่มีชื่อสอดคล้อง
             IntPtr foundHwnd = IntPtr.Zero;
             string targetFileName = Path.GetFileNameWithoutExtension(config.TargetPath);
 
@@ -393,14 +389,12 @@ namespace TrayWrapperApp
             {
                 GetWindowThreadProcessId(hWnd, out uint procId);
 
-                // ถ้าเป็น PID เดียวกับที่สั่งเปิด
                 if (spawnedPid > 0 && procId == spawnedPid)
                 {
                     foundHwnd = hWnd;
                     return false;
                 }
 
-                // หรือตรวจจาก Title ของหน้าต่าง
                 int length = GetWindowTextLength(hWnd);
                 if (length > 0)
                 {
@@ -425,24 +419,27 @@ namespace TrayWrapperApp
         {
             try
             {
-                IntPtr hWnd = FindProcessWindow();
-
-                if (hWnd == IntPtr.Zero)
+                if (targetConsoleHwnd == IntPtr.Zero)
                 {
-                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "ไม่พบหน้าต่างโปรแกรม หรือโปรแกรมทำงานแบบ Background", ToolTipIcon.Info);
+                    targetConsoleHwnd = FindProcessWindow();
+                }
+
+                if (targetConsoleHwnd == IntPtr.Zero)
+                {
+                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "กำลังค้นหาหน้าต่าง Console หรือโปรแกรมปิดตัวไปแล้ว", ToolTipIcon.Info);
                     return;
                 }
 
-                if (isWindowCurrentlyShown && IsWindowVisible(hWnd))
+                if (isWindowCurrentlyShown && IsWindowVisible(targetConsoleHwnd))
                 {
-                    ShowWindow(hWnd, SW_HIDE);
+                    ShowWindow(targetConsoleHwnd, SW_HIDE);
                     isWindowCurrentlyShown = false;
                 }
                 else
                 {
-                    ShowWindow(hWnd, SW_RESTORE);
-                    ShowWindow(hWnd, SW_SHOW);
-                    SetForegroundWindow(hWnd);
+                    ShowWindow(targetConsoleHwnd, SW_RESTORE);
+                    ShowWindow(targetConsoleHwnd, SW_SHOW);
+                    SetForegroundWindow(targetConsoleHwnd);
                     isWindowCurrentlyShown = true;
                 }
             }
@@ -464,6 +461,7 @@ namespace TrayWrapperApp
         {
             try
             {
+                targetConsoleHwnd = IntPtr.Zero;
                 if (childProcess != null && !childProcess.HasExited)
                 {
                     childProcess.Kill(entireProcessTree: true);
