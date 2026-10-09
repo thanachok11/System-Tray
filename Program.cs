@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -24,6 +25,29 @@ namespace TrayWrapperApp
 
     static class Program
     {
+        #region Win32 API
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        private const int SW_HIDE = 0;
+        private const int SW_SHOW = 5;
+        private const int SW_RESTORE = 9;
+        #endregion
+
         private static Mutex mutex;
         private static NotifyIcon trayIcon;
         private static Process childProcess;
@@ -31,13 +55,14 @@ namespace TrayWrapperApp
         private static bool isManualExit = false;
         private static DateTime processStartTime;
         private static int crashCount = 0;
+        private static bool isWindowCurrentlyShown = false;
 
         private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
         [STAThread]
         static void Main()
         {
-            // Single Instance Protection
+            // Single Instance Lock
             const string appGuid = "Global\\TrayWrapperApp_SingleInstance_Guid_987123";
             mutex = new Mutex(true, appGuid, out bool isNewInstance);
             if (!isNewInstance)
@@ -70,7 +95,6 @@ namespace TrayWrapperApp
 
             try
             {
-                // ลองแปลงแบบ JSON มาตรฐานก่อน
                 config = JsonSerializer.Deserialize<AppConfig>(rawText, new JsonSerializerOptions
                 {
                     ReadCommentHandling = JsonCommentHandling.Skip,
@@ -79,30 +103,21 @@ namespace TrayWrapperApp
             }
             catch
             {
-                // ถ้าติดเรื่อง Slash เดี่ยว (\) จากการ Copy as path ให้ใช้ระบบ Fallback Parser อัตโนมัติ
                 config = ParseConfigManually(rawText);
             }
 
-            if (config == null)
-            {
-                config = new AppConfig();
-            }
+            if (config == null) config = new AppConfig();
 
-            // ทำความสะอาด Path (ตัดเครื่องหมายคำพูดคู่ " " ออกถ้าผู้ใช้เผลอก๊อปมาติด)
             config.TargetPath = CleanPath(config.TargetPath);
             config.WorkingDirectory = CleanPath(config.WorkingDirectory);
             config.CustomIconPath = CleanPath(config.CustomIconPath);
 
-            // ถ้าไม่ได้กำหนด WorkingDirectory ให้คำนวณจาก TargetPath อัตโนมัติ
             if (string.IsNullOrWhiteSpace(config.WorkingDirectory) && !string.IsNullOrWhiteSpace(config.TargetPath))
             {
                 try
                 {
                     string dir = Path.GetDirectoryName(Path.GetFullPath(config.TargetPath));
-                    if (!string.IsNullOrWhiteSpace(dir))
-                    {
-                        config.WorkingDirectory = dir;
-                    }
+                    if (!string.IsNullOrWhiteSpace(dir)) config.WorkingDirectory = dir;
                 }
                 catch { }
             }
@@ -173,15 +188,20 @@ namespace TrayWrapperApp
                 Visible = true
             };
 
+            // ดับเบิ้ลคลิกเพื่อ สลับ แสดง/ซ่อน หน้าต่าง
+            trayIcon.DoubleClick += (s, e) => ToggleTargetWindow();
+
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             
             var statusItem = new ToolStripMenuItem("Status: Running") { Enabled = false };
+            var toggleWinItem = new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง (Show/Hide)", null, (s, e) => ToggleTargetWindow());
             var restartItem = new ToolStripMenuItem("🔄 Restart Service", null, (s, e) => RestartProcess());
             var openFolderItem = new ToolStripMenuItem("📁 Open Folder", null, (s, e) => OpenTargetFolder());
             var exitItem = new ToolStripMenuItem("❌ Exit", null, (s, e) => HandleExitRequest());
 
             contextMenu.Items.Add(statusItem);
             contextMenu.Items.Add(new ToolStripSeparator());
+            contextMenu.Items.Add(toggleWinItem);
             contextMenu.Items.Add(restartItem);
             contextMenu.Items.Add(openFolderItem);
             contextMenu.Items.Add(new ToolStripSeparator());
@@ -230,9 +250,14 @@ namespace TrayWrapperApp
 
                 if (config.HideWindow && ext != ".lnk")
                 {
+                    // ไม่ใช้ CreateNoWindow = true เพราะจะทำให้ไม่สามารถ toggle เปิดหน้าต่างขึ้นมาดูได้ในภายหลัง
                     psi.UseShellExecute = false;
-                    psi.CreateNoWindow = true;
                     psi.WindowStyle = ProcessWindowStyle.Hidden;
+                }
+                else
+                {
+                    psi.UseShellExecute = true;
+                    psi.WindowStyle = ProcessWindowStyle.Normal;
                 }
 
                 childProcess = new Process
@@ -242,6 +267,7 @@ namespace TrayWrapperApp
                 };
 
                 processStartTime = DateTime.Now;
+                isWindowCurrentlyShown = !config.HideWindow;
 
                 childProcess.Exited += (s, e) =>
                 {
@@ -266,10 +292,95 @@ namespace TrayWrapperApp
                 };
 
                 childProcess.Start();
+
+                // ถ้ากำหนดให้ซ่อน ให้ดักซ่อนหน้าต่างทันทีที่ process สร้าง window
+                if (config.HideWindow)
+                {
+                    Task.Run(async () =>
+                    {
+                        for (int i = 0; i < 10; i++)
+                        {
+                            await Task.Delay(200);
+                            IntPtr hWnd = FindProcessWindow();
+                            if (hWnd != IntPtr.Zero)
+                            {
+                                ShowWindow(hWnd, SW_HIDE);
+                                isWindowCurrentlyShown = false;
+                                break;
+                            }
+                        }
+                    });
+                }
             }
             catch (Exception ex)
             {
                 trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเปิด Process ได้: {ex.Message}", ToolTipIcon.Error);
+            }
+        }
+
+        private static IntPtr FindProcessWindow()
+        {
+            if (childProcess == null) return IntPtr.Zero;
+
+            try
+            {
+                childProcess.Refresh();
+                if (childProcess.MainWindowHandle != IntPtr.Zero)
+                {
+                    return childProcess.MainWindowHandle;
+                }
+
+                // ค้นหา Window Handle ของ process หรือ child process ที่สร้างขึ้น
+                IntPtr foundHwnd = IntPtr.Zero;
+                uint currentPid = (uint)childProcess.Id;
+
+                EnumWindows((hWnd, lParam) =>
+                {
+                    GetWindowThreadProcessId(hWnd, out uint procId);
+                    if (procId == currentPid)
+                    {
+                        foundHwnd = hWnd;
+                        return false; // หยุดหาเมื่อเจอแล้ว
+                    }
+                    return true;
+                }, IntPtr.Zero);
+
+                return foundHwnd;
+            }
+            catch
+            {
+                return IntPtr.Zero;
+            }
+        }
+
+        private static void ToggleTargetWindow()
+        {
+            try
+            {
+                IntPtr hWnd = FindProcessWindow();
+
+                if (hWnd == IntPtr.Zero)
+                {
+                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "โปรแกรมนี้ทำงานแบบ Background ไม่มีหน้าต่างให้แสดง", ToolTipIcon.Info);
+                    return;
+                }
+
+                if (isWindowCurrentlyShown && IsWindowVisible(hWnd))
+                {
+                    ShowWindow(hWnd, SW_HIDE);
+                    isWindowCurrentlyShown = false;
+                }
+                else
+                {
+                    ShowWindow(hWnd, SW_RESTORE);
+                    ShowWindow(hWnd, SW_SHOW);
+                    SetForegroundWindow(hWnd);
+                    isWindowCurrentlyShown = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                trayIcon?.ShowBalloonTip(3000, "Error", $"ไม่สามารถสลับหน้าต่างได้: {ex.Message}", ToolTipIcon.Warning);
             }
         }
 
