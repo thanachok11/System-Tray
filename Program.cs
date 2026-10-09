@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -13,12 +14,12 @@ namespace TrayWrapperApp
 {
     public class AppConfig
     {
-        public string TargetPath { get; set; } = @"C:\appsoft\bin\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat";
+        public string TargetPath { get; set; } = "";
         public string Arguments { get; set; } = "";
         public string WorkingDirectory { get; set; } = "";
-        public bool HideWindow { get; set; } = true;
+        public bool HideWindow { get; set; } = false;
         public bool AutoRestartOnCrash { get; set; } = false;
-        public string TrayTooltip { get; set; } = "Print Center Service";
+        public string TrayTooltip { get; set; } = "Tray Wrapper Service";
         public string CustomIconPath { get; set; } = "";
         public string ExitPassword { get; set; } = "";
     }
@@ -41,6 +42,12 @@ namespace TrayWrapperApp
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc enumProc, IntPtr lParam);
 
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetWindowTextLength(IntPtr hWnd);
+
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         private const int SW_HIDE = 0;
@@ -48,19 +55,20 @@ namespace TrayWrapperApp
         private const int SW_RESTORE = 9;
         #endregion
 
-        private static Mutex mutex;
-        private static NotifyIcon trayIcon;
-        private static Process childProcess;
-        private static AppConfig config;
+        private static Mutex? mutex;
+        private static NotifyIcon? trayIcon;
+        private static Process? childProcess;
+        private static AppConfig config = new AppConfig();
         private static bool isManualExit = false;
         private static DateTime processStartTime;
         private static int crashCount = 0;
-        private static bool isWindowCurrentlyShown = false;
+        private static bool isWindowCurrentlyShown = true;
+        private static int spawnedPid = 0;
 
         private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
             // Single Instance Lock
             const string appGuid = "Global\\TrayWrapperApp_SingleInstance_Guid_987123";
@@ -74,8 +82,30 @@ namespace TrayWrapperApp
             Application.SetCompatibleTextRenderingDefault(false);
 
             LoadConfig();
+
+            // 1. ถ้ารองรับ Drag & Drop ไฟล์มาวางบนไอคอน .exe ให้จำค่านั้นทันที
+            if (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
+            {
+                string droppedFile = CleanPath(args[0]);
+                if (File.Exists(droppedFile))
+                {
+                    config.TargetPath = droppedFile;
+                    config.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(droppedFile)) ?? "";
+                    SaveConfig();
+                }
+            }
+
             InitTrayIcon();
-            StartTargetProcess();
+
+            // 2. ถ้ายังไม่มี target ให้เด้งถามเลือกไฟล์
+            if (string.IsNullOrWhiteSpace(config.TargetPath) || !File.Exists(config.TargetPath))
+            {
+                PromptSelectTargetFile();
+            }
+            else
+            {
+                StartTargetProcess();
+            }
 
             Application.Run();
 
@@ -99,14 +129,12 @@ namespace TrayWrapperApp
                 {
                     ReadCommentHandling = JsonCommentHandling.Skip,
                     AllowTrailingCommas = true
-                });
+                }) ?? new AppConfig();
             }
             catch
             {
                 config = ParseConfigManually(rawText);
             }
-
-            if (config == null) config = new AppConfig();
 
             config.TargetPath = CleanPath(config.TargetPath);
             config.WorkingDirectory = CleanPath(config.WorkingDirectory);
@@ -116,7 +144,7 @@ namespace TrayWrapperApp
             {
                 try
                 {
-                    string dir = Path.GetDirectoryName(Path.GetFullPath(config.TargetPath));
+                    string? dir = Path.GetDirectoryName(Path.GetFullPath(config.TargetPath));
                     if (!string.IsNullOrWhiteSpace(dir)) config.WorkingDirectory = dir;
                 }
                 catch { }
@@ -127,7 +155,7 @@ namespace TrayWrapperApp
         {
             var cfg = new AppConfig();
 
-            string ExtractValue(string key)
+            string? ExtractValue(string key)
             {
                 var match = Regex.Match(text, $@"""{key}""\s*:\s*""?([^"",\r\n}}]+)""?", RegexOptions.IgnoreCase);
                 return match.Success ? match.Groups[1].Value.Trim() : null;
@@ -143,10 +171,10 @@ namespace TrayWrapperApp
             cfg.TargetPath = ExtractValue("TargetPath") ?? cfg.TargetPath;
             cfg.Arguments = ExtractValue("Arguments") ?? "";
             cfg.WorkingDirectory = ExtractValue("WorkingDirectory") ?? "";
-            cfg.TrayTooltip = ExtractValue("TrayTooltip") ?? "Print Center Service";
+            cfg.TrayTooltip = ExtractValue("TrayTooltip") ?? "Tray Wrapper Service";
             cfg.CustomIconPath = ExtractValue("CustomIconPath") ?? "";
             cfg.ExitPassword = ExtractValue("ExitPassword") ?? "";
-            cfg.HideWindow = ExtractBool("HideWindow", true);
+            cfg.HideWindow = ExtractBool("HideWindow", false);
             cfg.AutoRestartOnCrash = ExtractBool("AutoRestartOnCrash", false);
 
             return cfg;
@@ -188,21 +216,21 @@ namespace TrayWrapperApp
                 Visible = true
             };
 
-            // ดับเบิ้ลคลิกเพื่อ สลับ แสดง/ซ่อน หน้าต่าง
+            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน หน้าต่าง
             trayIcon.DoubleClick += (s, e) => ToggleTargetWindow();
 
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             
-            var statusItem = new ToolStripMenuItem("Status: Running") { Enabled = false };
             var toggleWinItem = new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง (Show/Hide)", null, (s, e) => ToggleTargetWindow());
             var restartItem = new ToolStripMenuItem("🔄 Restart Service", null, (s, e) => RestartProcess());
-            var openFolderItem = new ToolStripMenuItem("📁 Open Folder", null, (s, e) => OpenTargetFolder());
-            var exitItem = new ToolStripMenuItem("❌ Exit", null, (s, e) => HandleExitRequest());
+            var selectTargetItem = new ToolStripMenuItem("🎯 เปลี่ยนโปรแกรมเป้าหมาย...", null, (s, e) => PromptSelectTargetFile());
+            var openFolderItem = new ToolStripMenuItem("📁 เปิดโฟลเดอร์โปรแกรม", null, (s, e) => OpenTargetFolder());
+            var exitItem = new ToolStripMenuItem("❌ ปิดโปรแกรม (Exit)", null, (s, e) => HandleExitRequest());
 
-            contextMenu.Items.Add(statusItem);
-            contextMenu.Items.Add(new ToolStripSeparator());
             contextMenu.Items.Add(toggleWinItem);
             contextMenu.Items.Add(restartItem);
+            contextMenu.Items.Add(new ToolStripSeparator());
+            contextMenu.Items.Add(selectTargetItem);
             contextMenu.Items.Add(openFolderItem);
             contextMenu.Items.Add(new ToolStripSeparator());
             contextMenu.Items.Add(exitItem);
@@ -210,11 +238,34 @@ namespace TrayWrapperApp
             trayIcon.ContextMenuStrip = contextMenu;
         }
 
+        private static void PromptSelectTargetFile()
+        {
+            using (OpenFileDialog ofd = new OpenFileDialog())
+            {
+                ofd.Title = "เลือกไฟล์โปรแกรม (.bat / .exe / .lnk / script) ที่ต้องการครอบ";
+                ofd.Filter = "Executable & Scripts (*.bat;*.cmd;*.exe;*.lnk)|*.bat;*.cmd;*.exe;*.lnk|All Files (*.*)|*.*";
+                
+                if (ofd.ShowDialog() == DialogResult.OK)
+                {
+                    config.TargetPath = ofd.FileName;
+                    config.WorkingDirectory = Path.GetDirectoryName(ofd.FileName) ?? "";
+                    SaveConfig();
+
+                    // อัปเดตไอคอน
+                    InitTrayIcon();
+                    RestartProcess();
+                }
+            }
+        }
+
         private static void StartTargetProcess()
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(config.TargetPath)) return;
+                if (string.IsNullOrWhiteSpace(config.TargetPath) || !File.Exists(config.TargetPath))
+                {
+                    return;
+                }
 
                 string target = config.TargetPath;
                 string args = config.Arguments ?? "";
@@ -245,12 +296,11 @@ namespace TrayWrapperApp
                 }
                 else if (File.Exists(target))
                 {
-                    psi.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(target));
+                    psi.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(target)) ?? "";
                 }
 
                 if (config.HideWindow && ext != ".lnk")
                 {
-                    // ไม่ใช้ CreateNoWindow = true เพราะจะทำให้ไม่สามารถ toggle เปิดหน้าต่างขึ้นมาดูได้ในภายหลัง
                     psi.UseShellExecute = false;
                     psi.WindowStyle = ProcessWindowStyle.Hidden;
                 }
@@ -292,15 +342,16 @@ namespace TrayWrapperApp
                 };
 
                 childProcess.Start();
+                spawnedPid = childProcess.Id;
 
-                // ถ้ากำหนดให้ซ่อน ให้ดักซ่อนหน้าต่างทันทีที่ process สร้าง window
+                // ถ้าตั้งซ่อนหน้าต่างไว้ ให้รอหาหน้าต่างแล้วสั่งซ่อน
                 if (config.HideWindow)
                 {
                     Task.Run(async () =>
                     {
-                        for (int i = 0; i < 10; i++)
+                        for (int i = 0; i < 15; i++)
                         {
-                            await Task.Delay(200);
+                            await Task.Delay(300);
                             IntPtr hWnd = FindProcessWindow();
                             if (hWnd != IntPtr.Zero)
                             {
@@ -320,37 +371,54 @@ namespace TrayWrapperApp
 
         private static IntPtr FindProcessWindow()
         {
-            if (childProcess == null) return IntPtr.Zero;
-
-            try
+            // 1) ลองหาจาก childProcess โดยตรง
+            if (childProcess != null)
             {
-                childProcess.Refresh();
-                if (childProcess.MainWindowHandle != IntPtr.Zero)
+                try
                 {
-                    return childProcess.MainWindowHandle;
+                    childProcess.Refresh();
+                    if (childProcess.MainWindowHandle != IntPtr.Zero)
+                    {
+                        return childProcess.MainWindowHandle;
+                    }
+                }
+                catch { }
+            }
+
+            // 2) สแกนหาหน้าต่างของ Process ที่เกี่ยวข้อง หรือหน้าต่างที่มีชื่อสอดคล้อง
+            IntPtr foundHwnd = IntPtr.Zero;
+            string targetFileName = Path.GetFileNameWithoutExtension(config.TargetPath);
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                GetWindowThreadProcessId(hWnd, out uint procId);
+
+                // ถ้าเป็น PID เดียวกับที่สั่งเปิด
+                if (spawnedPid > 0 && procId == spawnedPid)
+                {
+                    foundHwnd = hWnd;
+                    return false;
                 }
 
-                // ค้นหา Window Handle ของ process หรือ child process ที่สร้างขึ้น
-                IntPtr foundHwnd = IntPtr.Zero;
-                uint currentPid = (uint)childProcess.Id;
-
-                EnumWindows((hWnd, lParam) =>
+                // หรือตรวจจาก Title ของหน้าต่าง
+                int length = GetWindowTextLength(hWnd);
+                if (length > 0)
                 {
-                    GetWindowThreadProcessId(hWnd, out uint procId);
-                    if (procId == currentPid)
+                    StringBuilder sb = new StringBuilder(length + 1);
+                    GetWindowText(hWnd, sb, sb.Capacity);
+                    string title = sb.ToString();
+
+                    if (!string.IsNullOrEmpty(targetFileName) && title.IndexOf(targetFileName, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         foundHwnd = hWnd;
-                        return false; // หยุดหาเมื่อเจอแล้ว
+                        return false;
                     }
-                    return true;
-                }, IntPtr.Zero);
+                }
 
-                return foundHwnd;
-            }
-            catch
-            {
-                return IntPtr.Zero;
-            }
+                return true;
+            }, IntPtr.Zero);
+
+            return foundHwnd;
         }
 
         private static void ToggleTargetWindow()
@@ -361,7 +429,7 @@ namespace TrayWrapperApp
 
                 if (hWnd == IntPtr.Zero)
                 {
-                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "โปรแกรมนี้ทำงานแบบ Background ไม่มีหน้าต่างให้แสดง", ToolTipIcon.Info);
+                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "ไม่พบหน้าต่างโปรแกรม หรือโปรแกรมทำงานแบบ Background", ToolTipIcon.Info);
                     return;
                 }
 
@@ -411,7 +479,7 @@ namespace TrayWrapperApp
             {
                 string dir = !string.IsNullOrWhiteSpace(config.WorkingDirectory) && Directory.Exists(config.WorkingDirectory)
                     ? config.WorkingDirectory
-                    : Path.GetDirectoryName(Path.GetFullPath(config.TargetPath));
+                    : Path.GetDirectoryName(Path.GetFullPath(config.TargetPath)) ?? "";
 
                 if (Directory.Exists(dir))
                 {
@@ -425,7 +493,7 @@ namespace TrayWrapperApp
         {
             if (!string.IsNullOrEmpty(config.ExitPassword))
             {
-                string input = PromptPasswordDialog("กรุณากรอกรหัสผ่านเพื่อปิดโปรแกรม:", "ยืนยันการปิด Service");
+                string? input = PromptPasswordDialog("กรุณากรอกรหัสผ่านเพื่อปิดโปรแกรม:", "ยืนยันการปิด Service");
                 if (input == null) return;
 
                 if (input != config.ExitPassword)
@@ -438,7 +506,7 @@ namespace TrayWrapperApp
             ExitApplication();
         }
 
-        private static string PromptPasswordDialog(string text, string caption)
+        private static string? PromptPasswordDialog(string text, string caption)
         {
             using (Form prompt = new Form())
             {
