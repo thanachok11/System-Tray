@@ -1,0 +1,9 @@
+{
+  "TargetPath": "Z:\\Prog\\Library_Release\\AutoStartPrintCenter\\AutoStartDevPrintCenterTimer.bat",
+  "Arguments": "",
+  "WorkingDirectory": "Z:\\Prog\\Library_Release\\AutoStartPrintCenter",
+  "HideWindow": true,
+  "AutoRestartOnCrash": true,
+  "TrayTooltip": "Print Center Service (Running)",
+  "CustomIconPath": ""
+}
