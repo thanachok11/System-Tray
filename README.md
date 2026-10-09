@@ -1,45 +1,46 @@
-# TrayWrapperApp (.NET Windows Forms System Tray)
+# TrayWrapperApp (.NET Windows Forms Multi-Program Tray Wrapper)
 
-โปรแกรมสำหรับครอบ (Wrap) ไฟล์ **`.bat`**, **`node.js`**, หรือ **`.exe`** ให้ทำงานอยู่เบื้องหลังใน **Windows System Tray (มุมขวาล่าง)** โดยซ่อนหน้าต่างดำ (Command Prompt) และมีเมนูคลิกขวาสั่ง **Restart** หรือ **Exit (พร้อมระบบรหัสผ่านป้องกันการปิด)**
+โปรแกรมสำหรับครอบ (Wrap) หลาย Service เช่น **`.bat`**, **`node.js`**, หรือ **`.exe`** พร้อมกันในตัวเดียว ให้ทำงานอยู่เบื้องหลังใน **Windows System Tray (มุมขวาล่าง)** โดยซ่อนหน้าต่างดำ (Command Prompt) ปิดปุ่มกากบาท `[X]` และมีเมนูควบคุมเปิด/ปิด/Restart ได้ทั้งแบบรวมและแยกรายตัว
 
 ---
 
 ## ✨ ความสามารถหลัก
-- 🚀 **ซ่อนหน้าต่าง Command Prompt (cmd.exe)**: ซ่อนหน้าต่างดำ ไม่ให้มี cmd เด้งลอยกวนใจ
-- 🔒 **ระบบรหัสผ่านก่อนปิด (Exit Password)**: ป้องกันไม่ให้ผู้ใช้หรือใครเผลอกดปิด Service ได้ง่ายๆ
-- 🔄 **Restart ได้ทันที**: เมนูคลิกขวาสั่ง `Restart Service` โดยจะทำการ Kill Process Tree (ปิดทั้ง cmd และ node.js ตัวลูกทั้งหมด) ก่อนเริ่มใหม่
-- 🛡️ **Single-Instance Protection**: ป้องกันการเปิดโปรแกรมซ้อนกันหลายตัว
-- ⚙️ **ตั้งค่าผ่าน `config.json`**: เปลี่ยน Path หรือแก้ไขการทำงานได้โดยไม่ต้อง compile โค้ดใหม่
+- 👥 **รองรับหลายโปรแกรมพร้อมกัน (Multi-Programs)**: รัน 2 โปรแกรมขึ้นไปได้ใน Tray Wrapper เดียว
+- 🚀 **ซ่อนหน้าต่างดำ Command Prompt**: ไม่เด้งขึ้นมากวนใจ
+- 🔒 **ปิดการทำงานปุ่มกากบาท `[X]` บนหน้าต่างดำ**: ป้องกันคนเผลอมือลั่นปิดหน้าต่าง Service
+- 🔐 **ระบบรหัสผ่านก่อนปิด (Exit Password)**: ถามรหัสผ่านก่อนจะยอมให้ปิด Service ทั้งหมด
+- 🖱️ **ดับเบิ้ลคลิกเพื่อ สลับเปิด/ซ่อน ทุกหน้าต่างพร้อมกัน**: เรียกดู log ได้ในคลิกเดียว
+- 🔄 **Restart All หรือ Restart แยกรายโปรแกรม**: สั่ง kill process tree อย่างปลอดภัย
 
 ---
 
-## ⚙️ ตัวอย่างการตั้งค่าใน `config.json`
-
-> **คำแนะนำ:** ในไฟล์ JSON ทุกครั้งที่พิมพ์ Path โฟลเดอร์ของ Windows ต้องใช้ `\\` (เบิ้ล 2 ตัว) เสมอครับ
+## ⚙️ ตัวอย่างการตั้งค่า `config.json` สำหรับ 2 โปรแกรม
 
 ```json
 {
-  "TargetPath": "Z:\\Prog\\Library_Release\\AutoStartPrintCenter\\AutoStartDevPrintCenterTimer.bat",
-  "Arguments": "",
-  "WorkingDirectory": "Z:\\Prog\\Library_Release\\AutoStartPrintCenter",
-  "HideWindow": true,
-  "AutoRestartOnCrash": false,
-  "TrayTooltip": "Print Center Service",
+  "TrayTooltip": "Print Center & Background Services",
   "CustomIconPath": "",
-  "ExitPassword": "your_password_here"
+  "ExitPassword": "1234",
+  "Programs": [
+    {
+      "Name": "Print Center Timer",
+      "TargetPath": "C:\\appsoft\\bin\\AutoStartPrintCenter\\AutoStartDevPrintCenterTimer.bat",
+      "Arguments": "",
+      "WorkingDirectory": "C:\\appsoft\\bin\\AutoStartPrintCenter",
+      "HideWindow": true,
+      "AutoRestartOnCrash": false
+    },
+    {
+      "Name": "Dev Cmd Timer",
+      "TargetPath": "C:\\appsoft\\bin\\AutoStartDevCmdTimer.bat",
+      "Arguments": "",
+      "WorkingDirectory": "C:\\appsoft\\bin",
+      "HideWindow": true,
+      "AutoRestartOnCrash": false
+    }
+  ]
 }
 ```
-
-| ค่า | คำอธิบาย | ตัวอย่าง |
-|---|---|---|
-| `TargetPath` | Path ของไฟล์ที่ต้องการรัน | `"Z:\\Prog\\Library_Release\\AutoStartPrintCenter\\AutoStartDevPrintCenterTimer.bat"` |
-| `Arguments` | Parameters หรือ Arguments เพิ่มเติม | `""` |
-| `WorkingDirectory` | โฟลเดอร์ที่ต้องการให้โปรแกรมรัน | `"Z:\\Prog\\Library_Release\\AutoStartPrintCenter"` |
-| `HideWindow` | ซ่อนหน้าต่างดำ | `true` |
-| `AutoRestartOnCrash` | เปิดใหม่เองถ้า Crash (สำหรับ .bat แนะนำ `false`) | `false` |
-| `TrayTooltip` | ข้อความ Tooltip เวลาชี้เมาส์ที่ไอคอน | `"Print Center Service"` |
-| `CustomIconPath` | Path ไฟล์ไอคอน `.ico` กำหนดเอง | `""` |
-| `ExitPassword` | **รหัสผ่านสำหรับสั่งปิด** (ถ้าไม่ใส่รหัสให้เว้นว่าง `""`) | `"1234"` |
 
 ---
 

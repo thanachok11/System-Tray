@@ -1,10 +1,23 @@
 {
-  "TargetPath": "Z:\\Prog\\Library_Release\\AutoStartPrintCenter\\AutoStartDevPrintCenterTimer.bat",
-  "Arguments": "",
-  "WorkingDirectory": "Z:\\Prog\\Library_Release\\AutoStartPrintCenter",
-  "HideWindow": true,
-  "AutoRestartOnCrash": false,
-  "TrayTooltip": "Print Center Service",
+  "TrayTooltip": "Print Center & Background Services",
   "CustomIconPath": "",
-  "ExitPassword": ""
+  "ExitPassword": "",
+  "Programs": [
+    {
+      "Name": "Print Center Timer",
+      "TargetPath": "C:\\appsoft\\bin\\AutoStartPrintCenter\\AutoStartDevPrintCenterTimer.bat",
+      "Arguments": "",
+      "WorkingDirectory": "C:\\appsoft\\bin\\AutoStartPrintCenter",
+      "HideWindow": true,
+      "AutoRestartOnCrash": false
+    },
+    {
+      "Name": "Dev Cmd Timer",
+      "TargetPath": "C:\\appsoft\\bin\\AutoStartDevCmdTimer.bat",
+      "Arguments": "",
+      "WorkingDirectory": "C:\\appsoft\\bin",
+      "HideWindow": true,
+      "AutoRestartOnCrash": false
+    }
+  ]
 }

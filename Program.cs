@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -12,16 +13,47 @@ using System.Windows.Forms;
 
 namespace TrayWrapperApp
 {
-    public class AppConfig
+    public class ProgramItemConfig
     {
-        public string TargetPath { get; set; } = @"C:\appsoft\bin\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat";
+        public string Name { get; set; } = "Service";
+        public string TargetPath { get; set; } = "";
         public string Arguments { get; set; } = "";
         public string WorkingDirectory { get; set; } = "";
         public bool HideWindow { get; set; } = true;
         public bool AutoRestartOnCrash { get; set; } = false;
-        public string TrayTooltip { get; set; } = "Print Center Service";
+    }
+
+    public class AppConfig
+    {
+        public string TrayTooltip { get; set; } = "Multi-Service Tray Wrapper";
         public string CustomIconPath { get; set; } = "";
         public string ExitPassword { get; set; } = "";
+        
+        // รองรับทั้งแบบหลายโปรแกรม (Programs List) และแบบเก่า (TargetPath เดี่ยว)
+        public List<ProgramItemConfig> Programs { get; set; } = new List<ProgramItemConfig>();
+
+        // Backward compatibility สำหรับ config เดิม
+        public string? TargetPath { get; set; }
+        public string? Arguments { get; set; }
+        public string? WorkingDirectory { get; set; }
+        public bool? HideWindow { get; set; }
+        public bool? AutoRestartOnCrash { get; set; }
+    }
+
+    public class ManagedApp
+    {
+        public ProgramItemConfig Config { get; set; }
+        public Process? ChildProcess { get; set; }
+        public IntPtr WindowHandle { get; set; } = IntPtr.Zero;
+        public bool IsWindowShown { get; set; } = false;
+        public int SpawnedPid { get; set; } = 0;
+        public DateTime StartTime { get; set; }
+        public int CrashCount { get; set; } = 0;
+
+        public ManagedApp(ProgramItemConfig config)
+        {
+            Config = config;
+        }
     }
 
     static class Program
@@ -71,21 +103,15 @@ namespace TrayWrapperApp
 
         private static Mutex? mutex;
         private static NotifyIcon? trayIcon;
-        private static Process? childProcess;
-        private static IntPtr targetConsoleHwnd = IntPtr.Zero;
         private static AppConfig config = new AppConfig();
+        private static List<ManagedApp> managedApps = new List<ManagedApp>();
         private static bool isManualExit = false;
-        private static DateTime processStartTime;
-        private static int crashCount = 0;
-        private static bool isWindowCurrentlyShown = false;
-        private static int spawnedPid = 0;
 
         private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
         [STAThread]
-        static void Main(string[] args)
+        static void Main()
         {
-            // Single Instance Lock
             const string appGuid = "Global\\TrayWrapperApp_SingleInstance_Guid_987123";
             mutex = new Mutex(true, appGuid, out bool isNewInstance);
             if (!isNewInstance)
@@ -97,29 +123,8 @@ namespace TrayWrapperApp
             Application.SetCompatibleTextRenderingDefault(false);
 
             LoadConfig();
-
-            // รองรับ Drag & Drop ไฟล์มาวางบนไอคอน
-            if (args != null && args.Length > 0 && !string.IsNullOrWhiteSpace(args[0]))
-            {
-                string droppedFile = CleanPath(args[0]);
-                if (File.Exists(droppedFile))
-                {
-                    config.TargetPath = droppedFile;
-                    config.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(droppedFile)) ?? "";
-                    SaveConfig();
-                }
-            }
-
             InitTrayIcon();
-
-            if (string.IsNullOrWhiteSpace(config.TargetPath) || !File.Exists(config.TargetPath))
-            {
-                PromptSelectTargetFile();
-            }
-            else
-            {
-                StartTargetProcess();
-            }
+            StartAllProcesses();
 
             Application.Run();
 
@@ -130,8 +135,7 @@ namespace TrayWrapperApp
         {
             if (!File.Exists(ConfigPath))
             {
-                config = new AppConfig();
-                SaveConfig();
+                CreateDefaultConfig();
                 return;
             }
 
@@ -147,51 +151,92 @@ namespace TrayWrapperApp
             }
             catch
             {
-                config = ParseConfigManually(rawText);
+                config = new AppConfig();
             }
 
-            config.TargetPath = CleanPath(config.TargetPath);
-            config.WorkingDirectory = CleanPath(config.WorkingDirectory);
-            config.CustomIconPath = CleanPath(config.CustomIconPath);
-
-            if (string.IsNullOrWhiteSpace(config.WorkingDirectory) && !string.IsNullOrWhiteSpace(config.TargetPath))
+            // ถ้ามีค่าจาก config เดิมแบบตัวเดียว ให้แปลงมาใส่ Programs List
+            if (config.Programs == null || config.Programs.Count == 0)
             {
-                try
+                if (!string.IsNullOrWhiteSpace(config.TargetPath))
                 {
-                    string? dir = Path.GetDirectoryName(Path.GetFullPath(config.TargetPath));
-                    if (!string.IsNullOrWhiteSpace(dir)) config.WorkingDirectory = dir;
+                    config.Programs = new List<ProgramItemConfig>
+                    {
+                        new ProgramItemConfig
+                        {
+                            Name = "Service 1",
+                            TargetPath = CleanPath(config.TargetPath),
+                            Arguments = config.Arguments ?? "",
+                            WorkingDirectory = CleanPath(config.WorkingDirectory ?? ""),
+                            HideWindow = config.HideWindow ?? true,
+                            AutoRestartOnCrash = config.AutoRestartOnCrash ?? false
+                        }
+                    };
                 }
-                catch { }
+                else
+                {
+                    CreateDefaultConfig();
+                    return;
+                }
+            }
+
+            // ตกแต่ง Path ของทุกโปรแกรม
+            managedApps.Clear();
+            foreach (var p in config.Programs)
+            {
+                p.TargetPath = CleanPath(p.TargetPath);
+                p.WorkingDirectory = CleanPath(p.WorkingDirectory);
+
+                if (string.IsNullOrWhiteSpace(p.WorkingDirectory) && !string.IsNullOrWhiteSpace(p.TargetPath))
+                {
+                    try
+                    {
+                        string? dir = Path.GetDirectoryName(Path.GetFullPath(p.TargetPath));
+                        if (!string.IsNullOrWhiteSpace(dir)) p.WorkingDirectory = dir;
+                    }
+                    catch { }
+                }
+
+                managedApps.Add(new ManagedApp(p));
             }
         }
 
-        private static AppConfig ParseConfigManually(string text)
+        private static void CreateDefaultConfig()
         {
-            var cfg = new AppConfig();
-
-            string? ExtractValue(string key)
+            config = new AppConfig
             {
-                var match = Regex.Match(text, $@"""{key}""\s*:\s*""?([^"",\r\n}}]+)""?", RegexOptions.IgnoreCase);
-                return match.Success ? match.Groups[1].Value.Trim() : null;
-            }
+                TrayTooltip = "Print Center & Secondary Services",
+                CustomIconPath = "",
+                ExitPassword = "",
+                Programs = new List<ProgramItemConfig>
+                {
+                    new ProgramItemConfig
+                    {
+                        Name = "Print Center Timer",
+                        TargetPath = @"C:\appsoft\bin\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat",
+                        Arguments = "",
+                        WorkingDirectory = @"C:\appsoft\bin\AutoStartPrintCenter",
+                        HideWindow = true,
+                        AutoRestartOnCrash = false
+                    },
+                    new ProgramItemConfig
+                    {
+                        Name = "Dev Cmd Timer",
+                        TargetPath = @"C:\appsoft\bin\AutoStartDevCmdTimer.bat",
+                        Arguments = "",
+                        WorkingDirectory = @"C:\appsoft\bin",
+                        HideWindow = true,
+                        AutoRestartOnCrash = false
+                    }
+                }
+            };
 
-            bool ExtractBool(string key, bool defaultVal)
+            SaveConfig();
+
+            managedApps.Clear();
+            foreach (var p in config.Programs)
             {
-                var val = ExtractValue(key);
-                if (val != null && bool.TryParse(val, out bool b)) return b;
-                return defaultVal;
+                managedApps.Add(new ManagedApp(p));
             }
-
-            cfg.TargetPath = ExtractValue("TargetPath") ?? cfg.TargetPath;
-            cfg.Arguments = ExtractValue("Arguments") ?? "";
-            cfg.WorkingDirectory = ExtractValue("WorkingDirectory") ?? "";
-            cfg.TrayTooltip = ExtractValue("TrayTooltip") ?? "Print Center Service";
-            cfg.CustomIconPath = ExtractValue("CustomIconPath") ?? "";
-            cfg.ExitPassword = ExtractValue("ExitPassword") ?? "";
-            cfg.HideWindow = ExtractBool("HideWindow", true);
-            cfg.AutoRestartOnCrash = ExtractBool("AutoRestartOnCrash", false);
-
-            return cfg;
         }
 
         private static string CleanPath(string path)
@@ -218,9 +263,9 @@ namespace TrayWrapperApp
             {
                 try { icon = new Icon(config.CustomIconPath); } catch { }
             }
-            else if (File.Exists(config.TargetPath) && Path.GetExtension(config.TargetPath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
+            else if (managedApps.Count > 0 && File.Exists(managedApps[0].Config.TargetPath) && Path.GetExtension(managedApps[0].Config.TargetPath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                try { icon = Icon.ExtractAssociatedIcon(config.TargetPath) ?? SystemIcons.Application; } catch { }
+                try { icon = Icon.ExtractAssociatedIcon(managedApps[0].Config.TargetPath) ?? SystemIcons.Application; } catch { }
             }
 
             trayIcon = new NotifyIcon
@@ -230,58 +275,64 @@ namespace TrayWrapperApp
                 Visible = true
             };
 
-            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน หน้าต่างทันที
-            trayIcon.DoubleClick += (s, e) => ToggleTargetWindow();
+            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน ทุกโปรแกรม
+            trayIcon.DoubleClick += (s, e) => ToggleAllTargetWindows();
+
+            UpdateContextMenu();
+        }
+
+        private static void UpdateContextMenu()
+        {
+            if (trayIcon == null) return;
 
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             
-            var toggleWinItem = new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง (Show/Hide)", null, (s, e) => ToggleTargetWindow());
-            var restartItem = new ToolStripMenuItem("🔄 Restart Service", null, (s, e) => RestartProcess());
-            var selectTargetItem = new ToolStripMenuItem("🎯 เปลี่ยนโปรแกรมเป้าหมาย...", null, (s, e) => PromptSelectTargetFile());
-            var openFolderItem = new ToolStripMenuItem("📁 เปิดโฟลเดอร์โปรแกรม", null, (s, e) => OpenTargetFolder());
-            var exitItem = new ToolStripMenuItem("❌ ปิดโปรแกรม (Exit)", null, (s, e) => HandleExitRequest());
+            var toggleAllItem = new ToolStripMenuItem("👁️ แสดง / ซ่อน ทุกหน้าต่าง (Show/Hide All)", null, (s, e) => ToggleAllTargetWindows());
+            var restartAllItem = new ToolStripMenuItem("🔄 Restart ทุกโปรแกรม (Restart All)", null, (s, e) => RestartAllProcesses());
+            
+            contextMenu.Items.Add(toggleAllItem);
+            contextMenu.Items.Add(restartAllItem);
+            contextMenu.Items.Add(new ToolStripSeparator());
 
-            contextMenu.Items.Add(toggleWinItem);
-            contextMenu.Items.Add(restartItem);
+            // เมนูย่อยสำหรับแต่ละโปรแกรม
+            for (int i = 0; i < managedApps.Count; i++)
+            {
+                var app = managedApps[i];
+                string displayName = string.IsNullOrWhiteSpace(app.Config.Name) ? $"โปรแกรม {i + 1}" : app.Config.Name;
+
+                var subMenu = new ToolStripMenuItem($"⚙️ {displayName}");
+                subMenu.DropDownItems.Add(new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง", null, (s, e) => ToggleSingleAppWindow(app)));
+                subMenu.DropDownItems.Add(new ToolStripMenuItem("🔄 Restart โปรแกรมนี้", null, (s, e) => RestartSingleProcess(app)));
+                subMenu.DropDownItems.Add(new ToolStripMenuItem("📁 เปิดโฟลเดอร์", null, (s, e) => OpenSingleFolder(app)));
+
+                contextMenu.Items.Add(subMenu);
+            }
+
             contextMenu.Items.Add(new ToolStripSeparator());
-            contextMenu.Items.Add(selectTargetItem);
-            contextMenu.Items.Add(openFolderItem);
-            contextMenu.Items.Add(new ToolStripSeparator());
-            contextMenu.Items.Add(exitItem);
+            contextMenu.Items.Add(new ToolStripMenuItem("❌ ปิดโปรแกรมทั้งหมด (Exit)", null, (s, e) => HandleExitRequest()));
 
             trayIcon.ContextMenuStrip = contextMenu;
         }
 
-        private static void PromptSelectTargetFile()
+        private static void StartAllProcesses()
         {
-            using (OpenFileDialog ofd = new OpenFileDialog())
+            foreach (var app in managedApps)
             {
-                ofd.Title = "เลือกไฟล์โปรแกรม (.bat / .exe / .lnk / script) ที่ต้องการครอบ";
-                ofd.Filter = "Executable & Scripts (*.bat;*.cmd;*.exe;*.lnk)|*.bat;*.cmd;*.exe;*.lnk|All Files (*.*)|*.*";
-                
-                if (ofd.ShowDialog() == DialogResult.OK)
-                {
-                    config.TargetPath = ofd.FileName;
-                    config.WorkingDirectory = Path.GetDirectoryName(ofd.FileName) ?? "";
-                    SaveConfig();
-
-                    InitTrayIcon();
-                    RestartProcess();
-                }
+                StartSingleProcess(app);
             }
         }
 
-        private static void StartTargetProcess()
+        private static void StartSingleProcess(ManagedApp app)
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(config.TargetPath) || !File.Exists(config.TargetPath))
+                if (string.IsNullOrWhiteSpace(app.Config.TargetPath) || !File.Exists(app.Config.TargetPath))
                 {
                     return;
                 }
 
-                string target = config.TargetPath;
-                string args = config.Arguments ?? "";
+                string target = app.Config.TargetPath;
+                string args = app.Config.Arguments ?? "";
                 string ext = Path.GetExtension(target).ToLower();
 
                 ProcessStartInfo psi = new ProcessStartInfo();
@@ -303,9 +354,9 @@ namespace TrayWrapperApp
                     psi.Arguments = args;
                 }
 
-                if (!string.IsNullOrWhiteSpace(config.WorkingDirectory) && Directory.Exists(config.WorkingDirectory))
+                if (!string.IsNullOrWhiteSpace(app.Config.WorkingDirectory) && Directory.Exists(app.Config.WorkingDirectory))
                 {
-                    psi.WorkingDirectory = config.WorkingDirectory;
+                    psi.WorkingDirectory = app.Config.WorkingDirectory;
                 }
                 else if (File.Exists(target))
                 {
@@ -315,61 +366,60 @@ namespace TrayWrapperApp
                 psi.UseShellExecute = true;
                 psi.WindowStyle = ProcessWindowStyle.Normal;
 
-                childProcess = new Process
+                app.ChildProcess = new Process
                 {
                     StartInfo = psi,
                     EnableRaisingEvents = true
                 };
 
-                processStartTime = DateTime.Now;
+                app.StartTime = DateTime.Now;
 
-                childProcess.Exited += (s, e) =>
+                app.ChildProcess.Exited += (s, e) =>
                 {
                     if (isManualExit) return;
 
-                    var runtime = DateTime.Now - processStartTime;
+                    var runtime = DateTime.Now - app.StartTime;
 
-                    if (!config.AutoRestartOnCrash || runtime.TotalSeconds < 10)
+                    if (!app.Config.AutoRestartOnCrash || runtime.TotalSeconds < 10)
                     {
                         return;
                     }
 
-                    crashCount++;
-                    if (crashCount <= 3)
+                    app.CrashCount++;
+                    if (app.CrashCount <= 3)
                     {
-                        Task.Delay(5000).ContinueWith(_ => StartTargetProcess());
+                        Task.Delay(5000).ContinueWith(_ => StartSingleProcess(app));
                     }
                     else
                     {
-                        trayIcon?.ShowBalloonTip(5000, "Tray Wrapper", "Service หยุดทำงานบ่อยเกินไป จึงระงับ Auto-Restart", ToolTipIcon.Warning);
+                        trayIcon?.ShowBalloonTip(5000, "Tray Wrapper", $"โปรแกรม {app.Config.Name} ดับบ่อยเกินไป จึงระงับ Auto-Restart", ToolTipIcon.Warning);
                     }
                 };
 
-                childProcess.Start();
-                spawnedPid = childProcess.Id;
+                app.ChildProcess.Start();
+                app.SpawnedPid = app.ChildProcess.Id;
 
-                // จับ Window Handle, ปิดปุ่มกากบาท [X] และสั่งซ่อนถ้าตั้งค่า HideWindow ไว้
+                // จับ Window Handle, ปิดปุ่ม [X] และซ่อนหน้าต่าง
                 Task.Run(async () =>
                 {
-                    targetConsoleHwnd = IntPtr.Zero;
+                    app.WindowHandle = IntPtr.Zero;
 
                     for (int i = 0; i < 20; i++)
                     {
                         await Task.Delay(150);
-                        targetConsoleHwnd = FindProcessWindow();
-                        if (targetConsoleHwnd != IntPtr.Zero)
+                        app.WindowHandle = FindProcessWindow(app);
+                        if (app.WindowHandle != IntPtr.Zero)
                         {
-                            // 🔒 ปิดปุ่มกากบาท [X] ทันที ป้องกัน User เผลอกดปิด
-                            DisableCloseButton(targetConsoleHwnd);
+                            DisableCloseButton(app.WindowHandle);
 
-                            if (config.HideWindow)
+                            if (app.Config.HideWindow)
                             {
-                                ShowWindow(targetConsoleHwnd, SW_HIDE);
-                                isWindowCurrentlyShown = false;
+                                ShowWindow(app.WindowHandle, SW_HIDE);
+                                app.IsWindowShown = false;
                             }
                             else
                             {
-                                isWindowCurrentlyShown = true;
+                                app.IsWindowShown = true;
                             }
                             break;
                         }
@@ -378,7 +428,7 @@ namespace TrayWrapperApp
             }
             catch (Exception ex)
             {
-                trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเปิด Process ได้: {ex.Message}", ToolTipIcon.Error);
+                trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเปิด {app.Config.Name} ได้: {ex.Message}", ToolTipIcon.Error);
             }
         }
 
@@ -397,29 +447,29 @@ namespace TrayWrapperApp
             catch { }
         }
 
-        private static IntPtr FindProcessWindow()
+        private static IntPtr FindProcessWindow(ManagedApp app)
         {
-            if (childProcess != null)
+            if (app.ChildProcess != null)
             {
                 try
                 {
-                    childProcess.Refresh();
-                    if (childProcess.MainWindowHandle != IntPtr.Zero)
+                    app.ChildProcess.Refresh();
+                    if (app.ChildProcess.MainWindowHandle != IntPtr.Zero)
                     {
-                        return childProcess.MainWindowHandle;
+                        return app.ChildProcess.MainWindowHandle;
                     }
                 }
                 catch { }
             }
 
             IntPtr foundHwnd = IntPtr.Zero;
-            string targetFileName = Path.GetFileNameWithoutExtension(config.TargetPath);
+            string targetFileName = Path.GetFileNameWithoutExtension(app.Config.TargetPath);
 
             EnumWindows((hWnd, lParam) =>
             {
                 GetWindowThreadProcessId(hWnd, out uint procId);
 
-                if (spawnedPid > 0 && procId == spawnedPid)
+                if (app.SpawnedPid > 0 && procId == app.SpawnedPid)
                 {
                     foundHwnd = hWnd;
                     return false;
@@ -445,35 +495,72 @@ namespace TrayWrapperApp
             return foundHwnd;
         }
 
-        private static void ToggleTargetWindow()
+        private static void ToggleAllTargetWindows()
         {
-            try
+            bool anyVisible = false;
+
+            foreach (var app in managedApps)
             {
-                if (targetConsoleHwnd == IntPtr.Zero)
+                if (app.WindowHandle == IntPtr.Zero) app.WindowHandle = FindProcessWindow(app);
+                if (app.WindowHandle != IntPtr.Zero && IsWindowVisible(app.WindowHandle))
                 {
-                    targetConsoleHwnd = FindProcessWindow();
+                    anyVisible = true;
+                    break;
                 }
+            }
 
-                if (targetConsoleHwnd == IntPtr.Zero)
+            // ถ้ามีอย่างน้อย 1 ตัวเปิดอยู่ -> สั่งซ่อนทั้งหมด
+            // ถ้าทุกตัวซ่อนอยู่ -> สั่งเปิดทั้งหมด
+            foreach (var app in managedApps)
+            {
+                if (app.WindowHandle == IntPtr.Zero) app.WindowHandle = FindProcessWindow(app);
+                if (app.WindowHandle == IntPtr.Zero) continue;
+
+                DisableCloseButton(app.WindowHandle);
+
+                if (anyVisible)
                 {
-                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "กำลังค้นหาหน้าต่าง Console หรือโปรแกรมปิดตัวไปแล้ว", ToolTipIcon.Info);
-                    return;
-                }
-
-                // ล็อกปุ่ม [X] ทุกครั้งที่มีการเปิดหน้าต่าง
-                DisableCloseButton(targetConsoleHwnd);
-
-                if (isWindowCurrentlyShown && IsWindowVisible(targetConsoleHwnd))
-                {
-                    ShowWindow(targetConsoleHwnd, SW_HIDE);
-                    isWindowCurrentlyShown = false;
+                    ShowWindow(app.WindowHandle, SW_HIDE);
+                    app.IsWindowShown = false;
                 }
                 else
                 {
-                    ShowWindow(targetConsoleHwnd, SW_RESTORE);
-                    ShowWindow(targetConsoleHwnd, SW_SHOW);
-                    SetForegroundWindow(targetConsoleHwnd);
-                    isWindowCurrentlyShown = true;
+                    ShowWindow(app.WindowHandle, SW_RESTORE);
+                    ShowWindow(app.WindowHandle, SW_SHOW);
+                    SetForegroundWindow(app.WindowHandle);
+                    app.IsWindowShown = true;
+                }
+            }
+        }
+
+        private static void ToggleSingleAppWindow(ManagedApp app)
+        {
+            try
+            {
+                if (app.WindowHandle == IntPtr.Zero)
+                {
+                    app.WindowHandle = FindProcessWindow(app);
+                }
+
+                if (app.WindowHandle == IntPtr.Zero)
+                {
+                    trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", $"ไม่พบหน้าต่างของ {app.Config.Name}", ToolTipIcon.Info);
+                    return;
+                }
+
+                DisableCloseButton(app.WindowHandle);
+
+                if (app.IsWindowShown && IsWindowVisible(app.WindowHandle))
+                {
+                    ShowWindow(app.WindowHandle, SW_HIDE);
+                    app.IsWindowShown = false;
+                }
+                else
+                {
+                    ShowWindow(app.WindowHandle, SW_RESTORE);
+                    ShowWindow(app.WindowHandle, SW_SHOW);
+                    SetForegroundWindow(app.WindowHandle);
+                    app.IsWindowShown = true;
                 }
             }
             catch (Exception ex)
@@ -482,35 +569,43 @@ namespace TrayWrapperApp
             }
         }
 
-        private static void RestartProcess()
+        private static void RestartAllProcesses()
         {
-            crashCount = 0;
-            KillTargetProcess();
-            StartTargetProcess();
-            trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "สั่ง Restart เรียบร้อยแล้ว", ToolTipIcon.Info);
+            foreach (var app in managedApps)
+            {
+                RestartSingleProcess(app);
+            }
+            trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "สั่ง Restart ทุกโปรแกรมเรียบร้อยแล้ว", ToolTipIcon.Info);
         }
 
-        private static void KillTargetProcess()
+        private static void RestartSingleProcess(ManagedApp app)
+        {
+            app.CrashCount = 0;
+            KillSingleProcess(app);
+            StartSingleProcess(app);
+        }
+
+        private static void KillSingleProcess(ManagedApp app)
         {
             try
             {
-                targetConsoleHwnd = IntPtr.Zero;
-                if (childProcess != null && !childProcess.HasExited)
+                app.WindowHandle = IntPtr.Zero;
+                if (app.ChildProcess != null && !app.ChildProcess.HasExited)
                 {
-                    childProcess.Kill(entireProcessTree: true);
-                    childProcess.WaitForExit(3000);
+                    app.ChildProcess.Kill(entireProcessTree: true);
+                    app.ChildProcess.WaitForExit(3000);
                 }
             }
             catch { }
         }
 
-        private static void OpenTargetFolder()
+        private static void OpenSingleFolder(ManagedApp app)
         {
             try
             {
-                string dir = !string.IsNullOrWhiteSpace(config.WorkingDirectory) && Directory.Exists(config.WorkingDirectory)
-                    ? config.WorkingDirectory
-                    : Path.GetDirectoryName(Path.GetFullPath(config.TargetPath)) ?? "";
+                string dir = !string.IsNullOrWhiteSpace(app.Config.WorkingDirectory) && Directory.Exists(app.Config.WorkingDirectory)
+                    ? app.Config.WorkingDirectory
+                    : Path.GetDirectoryName(Path.GetFullPath(app.Config.TargetPath)) ?? "";
 
                 if (Directory.Exists(dir))
                 {
@@ -524,7 +619,7 @@ namespace TrayWrapperApp
         {
             if (!string.IsNullOrEmpty(config.ExitPassword))
             {
-                string? input = PromptPasswordDialog("กรุณากรอกรหัสผ่านเพื่อปิดโปรแกรม:", "ยืนยันการปิด Service");
+                string? input = PromptPasswordDialog("กรุณากรอกรหัสผ่านเพื่อปิดโปรแกรมทั้งหมด:", "ยืนยันการปิด Services");
                 if (input == null) return;
 
                 if (input != config.ExitPassword)
@@ -577,7 +672,12 @@ namespace TrayWrapperApp
             {
                 trayIcon.Visible = false;
             }
-            KillTargetProcess();
+
+            foreach (var app in managedApps)
+            {
+                KillSingleProcess(app);
+            }
+
             Application.Exit();
         }
     }
