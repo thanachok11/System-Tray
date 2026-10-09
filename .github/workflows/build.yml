@@ -1,0 +1,60 @@
+name: Build and Release Windows App
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows x64 Executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Publish Windows Single-File Executable
+        run: |
+          dotnet publish TrayWrapperApp.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o ./publish
+
+      - name: Create Release Zip Archive
+        shell: pwsh
+        run: |
+          Compress-Archive -Path ./publish/* -DestinationPath ./TrayWrapperApp-Windows-x64.zip
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrayWrapperApp-Windows-x64
+          path: ./publish/
+
+      - name: Create / Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: latest
+          name: "TrayWrapperApp Latest Build"
+          body: |
+            ### 🚀 TrayWrapperApp Windows Build
+            - **Target OS:** Windows x64
+            - **Type:** Single-file executable (Self-contained, ไม่ต้องลง .NET Runtime)
+            - **Include:** `TrayWrapperApp.exe` และ `config.json`
+            
+            **วิธีใช้งาน:**
+            1. ดาวน์โหลดไฟล์ `TrayWrapperApp-Windows-x64.zip`
+            2. แตกไฟล์ (.zip) ออกมา
+            3. แก้ไข Path ไฟล์เป้าหมายใน `config.json`
+            4. ดับเบิ้ลคลิก `TrayWrapperApp.exe` ใช้งานได้ทันที
+          files: |
+            ./TrayWrapperApp-Windows-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
