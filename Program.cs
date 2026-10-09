@@ -3,74 +3,58 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace TrayWrapperApp
 {
     public class AppConfig
     {
-        /// <summary>
-        /// ไฟล์ที่ต้องการรัน เช่น "AutoStartDevPrintCenterTimer.bat" หรือ @"C:\Path\To\app.bat" หรือ "node.exe"
-        /// </summary>
         public string TargetPath { get; set; } = @"Z:\Prog\Library_Release\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat";
-
-        /// <summary>
-        /// Arguments เพิ่มเติม (ถ้ามี) เช่น "index.js"
-        /// </summary>
         public string Arguments { get; set; } = "";
-
-        /// <summary>
-        /// Working Directory (ถ้าเว้นว่างจะใช้โฟลเดอร์เดียวกับ TargetPath อัตโนมัติ)
-        /// </summary>
         public string WorkingDirectory { get; set; } = "";
-
-        /// <summary>
-        /// ซ่อนหน้าต่างดำ (Command Prompt) หรือไม่
-        /// </summary>
         public bool HideWindow { get; set; } = true;
-
-        /// <summary>
-        /// ถ้า Service ดับหรือ Crash ให้เปิดใหม่เองอัตโนมัติหรือไม่
-        /// </summary>
-        public bool AutoRestartOnCrash { get; set; } = true;
-
-        /// <summary>
-        /// ข้อความ Tooltip เมื่อเอาเมาส์ไปชี้ที่ System Tray Icon
-        /// </summary>
-        public string TrayTooltip { get; set; } = "Print Center Service (Running)";
-
-        /// <summary>
-        /// Path ของไฟล์ .ico กำหนดเอง (ถ้าไม่มีจะใช้ Icon ระบบ)
-        /// </summary>
+        public bool AutoRestartOnCrash { get; set; } = false; // ปิดเป็น default เพื่อไม่ให้ loop ถ้าไฟล์ .bat exit เร็ว
+        public string TrayTooltip { get; set; } = "Print Center Service";
         public string CustomIconPath { get; set; } = "";
     }
 
     static class Program
     {
+        private static Mutex mutex;
         private static NotifyIcon trayIcon;
         private static Process childProcess;
         private static AppConfig config;
         private static bool isManualExit = false;
+        private static DateTime processStartTime;
+        private static int crashCount = 0;
 
         private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
 
         [STAThread]
         static void Main()
         {
+            // 1. Single Instance Protection (รันได้ทีละ 1 ตัวเท่านั้น)
+            const string appGuid = "Global\\TrayWrapperApp_SingleInstance_Guid_987123";
+            mutex = new Mutex(true, appGuid, out bool isNewInstance);
+            if (!isNewInstance)
+            {
+                // ถ้ามีตัวเดิมเปิดอยู่แล้ว ให้ปิดตัวใหม่ทันที
+                return;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // 1. โหลดการตั้งค่าจาก config.json
             LoadConfig();
-
-            // 2. สร้าง System Tray Icon
             InitTrayIcon();
-
-            // 3. เริ่มรันไฟล์เป้าหมาย (.bat / node / .exe)
             StartTargetProcess();
 
-            // รัน background loop
             Application.Run();
+
+            // Release Mutex
+            GC.KeepAlive(mutex);
         }
 
         private static void LoadConfig()
@@ -99,12 +83,10 @@ namespace TrayWrapperApp
         {
             Icon icon = SystemIcons.Application;
 
-            // 1) เช็คว่ามี custom icon หรือไม่
             if (!string.IsNullOrEmpty(config.CustomIconPath) && File.Exists(config.CustomIconPath))
             {
                 try { icon = new Icon(config.CustomIconPath); } catch { }
             }
-            // 2) หรือถ้าเป็นไฟล์ .exe ให้ดึง icon ของไฟล์นั้นมาใช้อัตโนมัติ
             else if (File.Exists(config.TargetPath) && Path.GetExtension(config.TargetPath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
             {
                 try { icon = Icon.ExtractAssociatedIcon(config.TargetPath) ?? SystemIcons.Application; } catch { }
@@ -117,12 +99,11 @@ namespace TrayWrapperApp
                 Visible = true
             };
 
-            // สร้าง Context Menu (คลิกขวาที่ Tray Icon)
             ContextMenuStrip contextMenu = new ContextMenuStrip();
             
-            var statusItem = new ToolStripMenuItem("Status: Running") { Enabled = false };
-            var restartItem = new ToolStripMenuItem("🔄 Restart Service", null, (s, e) => RestartProcess());
-            var openFolderItem = new ToolStripMenuItem("📁 Open Target Folder", null, (s, e) => OpenTargetFolder());
+            var statusItem = new ToolStripMenuItem("Tray Wrapper: Active") { Enabled = false };
+            var restartItem = new ToolStripMenuItem("🔄 Restart Target", null, (s, e) => RestartProcess());
+            var openFolderItem = new ToolStripMenuItem("📁 Open Folder", null, (s, e) => OpenTargetFolder());
             var exitItem = new ToolStripMenuItem("❌ Exit", null, (s, e) => ExitApplication());
 
             contextMenu.Items.Add(statusItem);
@@ -147,7 +128,6 @@ namespace TrayWrapperApp
 
                 ProcessStartInfo psi = new ProcessStartInfo();
 
-                // ถ้ารันไฟล์ .bat หรือ .cmd ในโหมดซ่อน ต้องสั่งผ่าน cmd.exe /c
                 if (ext == ".bat" || ext == ".cmd")
                 {
                     psi.FileName = "cmd.exe";
@@ -159,7 +139,6 @@ namespace TrayWrapperApp
                     psi.Arguments = args;
                 }
 
-                // กำหนด Working Directory
                 if (!string.IsNullOrWhiteSpace(config.WorkingDirectory) && Directory.Exists(config.WorkingDirectory))
                 {
                     psi.WorkingDirectory = config.WorkingDirectory;
@@ -187,12 +166,28 @@ namespace TrayWrapperApp
                     EnableRaisingEvents = true
                 };
 
+                processStartTime = DateTime.Now;
+
                 childProcess.Exited += (s, e) =>
                 {
-                    if (!isManualExit && config.AutoRestartOnCrash)
+                    if (isManualExit) return;
+
+                    var runtime = DateTime.Now - processStartTime;
+
+                    // ป้องกันลูปนรก: ถ้ารันไม่ถึง 10 วินาทีแล้วดับ หรือ Exit Code เป็น 0 (ทำงานเสร็จปกติ) จะไม่ restart ซ้ำ
+                    if (!config.AutoRestartOnCrash || runtime.TotalSeconds < 10)
                     {
-                        // ถ้า process ดับโดยไม่ได้สั่งปิด ให้ restart ตัวเองใหม่อัตโนมัติใน 3 วินาที
-                        System.Threading.Tasks.Task.Delay(3000).ContinueWith(_ => StartTargetProcess());
+                        return;
+                    }
+
+                    crashCount++;
+                    if (crashCount <= 3)
+                    {
+                        Task.Delay(5000).ContinueWith(_ => StartTargetProcess());
+                    }
+                    else
+                    {
+                        trayIcon?.ShowBalloonTip(5000, "Tray Wrapper", "Process ดับบ่อยเกินไป จึงหยุด Auto-Restart อัตโนมัติ", ToolTipIcon.Warning);
                     }
                 };
 
@@ -200,15 +195,16 @@ namespace TrayWrapperApp
             }
             catch (Exception ex)
             {
-                trayIcon.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเริ่ม Process ได้: {ex.Message}", ToolTipIcon.Error);
+                trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Error", $"ไม่สามารถเปิดไฟล์ได้: {ex.Message}", ToolTipIcon.Error);
             }
         }
 
         private static void RestartProcess()
         {
+            crashCount = 0;
             KillTargetProcess();
             StartTargetProcess();
-            trayIcon.ShowBalloonTip(2000, "Tray Wrapper", "Service ถูกสั่ง Restart แล้ว", ToolTipIcon.Info);
+            trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", "สั่ง Restart เรียบร้อยแล้ว", ToolTipIcon.Info);
         }
 
         private static void KillTargetProcess()
@@ -217,7 +213,6 @@ namespace TrayWrapperApp
             {
                 if (childProcess != null && !childProcess.HasExited)
                 {
-                    // ฆ่าทั้ง Process Tree เพื่อให้ลูกๆ เช่น node.exe ดับตามไปด้วย
                     childProcess.Kill(entireProcessTree: true);
                     childProcess.WaitForExit(3000);
                 }
@@ -244,7 +239,10 @@ namespace TrayWrapperApp
         private static void ExitApplication()
         {
             isManualExit = true;
-            trayIcon.Visible = false;
+            if (trayIcon != null)
+            {
+                trayIcon.Visible = false;
+            }
             KillTargetProcess();
             Application.Exit();
         }

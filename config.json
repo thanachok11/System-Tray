@@ -3,7 +3,7 @@
   "Arguments": "",
   "WorkingDirectory": "Z:\\Prog\\Library_Release\\AutoStartPrintCenter",
   "HideWindow": true,
-  "AutoRestartOnCrash": true,
-  "TrayTooltip": "Print Center Service (Running)",
+  "AutoRestartOnCrash": false,
+  "TrayTooltip": "Print Center Service",
   "CustomIconPath": ""
 }
