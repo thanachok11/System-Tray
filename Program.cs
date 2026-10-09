@@ -25,14 +25,12 @@ namespace TrayWrapperApp
 
     public class AppConfig
     {
-        public string TrayTooltip { get; set; } = "Multi-Service Tray Wrapper";
+        public string TrayTooltip { get; set; } = "Print Center & Background Services";
         public string CustomIconPath { get; set; } = "";
         public string ExitPassword { get; set; } = "";
-        
-        // รองรับทั้งแบบหลายโปรแกรม (Programs List) และแบบเก่า (TargetPath เดี่ยว)
         public List<ProgramItemConfig> Programs { get; set; } = new List<ProgramItemConfig>();
 
-        // Backward compatibility สำหรับ config เดิม
+        // Backward compatibility
         public string? TargetPath { get; set; }
         public string? Arguments { get; set; }
         public string? WorkingDirectory { get; set; }
@@ -154,7 +152,6 @@ namespace TrayWrapperApp
                 config = new AppConfig();
             }
 
-            // ถ้ามีค่าจาก config เดิมแบบตัวเดียว ให้แปลงมาใส่ Programs List
             if (config.Programs == null || config.Programs.Count == 0)
             {
                 if (!string.IsNullOrWhiteSpace(config.TargetPath))
@@ -179,7 +176,6 @@ namespace TrayWrapperApp
                 }
             }
 
-            // ตกแต่ง Path ของทุกโปรแกรม
             managedApps.Clear();
             foreach (var p in config.Programs)
             {
@@ -275,7 +271,6 @@ namespace TrayWrapperApp
                 Visible = true
             };
 
-            // ดับเบิ้ลคลิกเพื่อสลับ แสดง/ซ่อน ทุกโปรแกรม
             trayIcon.DoubleClick += (s, e) => ToggleAllTargetWindows();
 
             UpdateContextMenu();
@@ -294,7 +289,6 @@ namespace TrayWrapperApp
             contextMenu.Items.Add(restartAllItem);
             contextMenu.Items.Add(new ToolStripSeparator());
 
-            // เมนูย่อยสำหรับแต่ละโปรแกรม
             for (int i = 0; i < managedApps.Count; i++)
             {
                 var app = managedApps[i];
@@ -363,8 +357,17 @@ namespace TrayWrapperApp
                     psi.WorkingDirectory = Path.GetDirectoryName(Path.GetFullPath(target)) ?? "";
                 }
 
-                psi.UseShellExecute = true;
-                psi.WindowStyle = ProcessWindowStyle.Normal;
+                // สั่งซ่อนจากตอนสร้าง process ทันที เพื่อไม่ให้มี icon โผล่ขึ้นมาบน Taskbar ตั้งแต่เริ่มต้น
+                if (app.Config.HideWindow && ext != ".lnk")
+                {
+                    psi.UseShellExecute = false;
+                    psi.WindowStyle = ProcessWindowStyle.Hidden;
+                }
+                else
+                {
+                    psi.UseShellExecute = true;
+                    psi.WindowStyle = ProcessWindowStyle.Normal;
+                }
 
                 app.ChildProcess = new Process
                 {
@@ -399,14 +402,14 @@ namespace TrayWrapperApp
                 app.ChildProcess.Start();
                 app.SpawnedPid = app.ChildProcess.Id;
 
-                // จับ Window Handle, ปิดปุ่ม [X] และซ่อนหน้าต่าง
+                // ตรวจหา Window Handle, ปิดปุ่ม [X] และยืนยันการซ่อนออกจาก Taskbar
                 Task.Run(async () =>
                 {
                     app.WindowHandle = IntPtr.Zero;
 
-                    for (int i = 0; i < 20; i++)
+                    for (int i = 0; i < 25; i++)
                     {
-                        await Task.Delay(150);
+                        await Task.Delay(100);
                         app.WindowHandle = FindProcessWindow(app);
                         if (app.WindowHandle != IntPtr.Zero)
                         {
@@ -509,8 +512,6 @@ namespace TrayWrapperApp
                 }
             }
 
-            // ถ้ามีอย่างน้อย 1 ตัวเปิดอยู่ -> สั่งซ่อนทั้งหมด
-            // ถ้าทุกตัวซ่อนอยู่ -> สั่งเปิดทั้งหมด
             foreach (var app in managedApps)
             {
                 if (app.WindowHandle == IntPtr.Zero) app.WindowHandle = FindProcessWindow(app);
