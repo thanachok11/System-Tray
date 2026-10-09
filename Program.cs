@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -11,17 +12,13 @@ namespace TrayWrapperApp
 {
     public class AppConfig
     {
-        public string TargetPath { get; set; } = @"Z:\Prog\Library_Release\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat";
+        public string TargetPath { get; set; } = @"C:\appsoft\bin\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat";
         public string Arguments { get; set; } = "";
-        public string WorkingDirectory { get; set; } = @"Z:\Prog\Library_Release\AutoStartPrintCenter";
+        public string WorkingDirectory { get; set; } = "";
         public bool HideWindow { get; set; } = true;
         public bool AutoRestartOnCrash { get; set; } = false;
         public string TrayTooltip { get; set; } = "Print Center Service";
         public string CustomIconPath { get; set; } = "";
-        
-        /// <summary>
-        /// รหัสผ่านสำหรับสั่งปิดโปรแกรม (ถ้าเว้นว่างไว้ "" จะไม่ต้องใส่รหัส)
-        /// </summary>
         public string ExitPassword { get; set; } = "";
     }
 
@@ -40,7 +37,7 @@ namespace TrayWrapperApp
         [STAThread]
         static void Main()
         {
-            // 1. Single Instance Lock (รันได้ 1 ตัวเท่านั้น)
+            // Single Instance Protection
             const string appGuid = "Global\\TrayWrapperApp_SingleInstance_Guid_987123";
             mutex = new Mutex(true, appGuid, out bool isNewInstance);
             if (!isNewInstance)
@@ -62,29 +59,98 @@ namespace TrayWrapperApp
 
         private static void LoadConfig()
         {
-            try
-            {
-                if (File.Exists(ConfigPath))
-                {
-                    string json = File.ReadAllText(ConfigPath);
-                    config = JsonSerializer.Deserialize<AppConfig>(json, new JsonSerializerOptions
-                    {
-                        ReadCommentHandling = JsonCommentHandling.Skip,
-                        AllowTrailingCommas = true
-                    }) ?? new AppConfig();
-                }
-                else
-                {
-                    config = new AppConfig();
-                    string json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
-                    File.WriteAllText(ConfigPath, json);
-                }
-            }
-            catch (Exception ex)
+            if (!File.Exists(ConfigPath))
             {
                 config = new AppConfig();
-                MessageBox.Show($"พบข้อผิดพลาดใน config.json: {ex.Message}\nระบบจะใช้ค่าเริ่มต้น", "Config Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                SaveConfig();
+                return;
             }
+
+            string rawText = File.ReadAllText(ConfigPath);
+
+            try
+            {
+                // ลองแปลงแบบ JSON มาตรฐานก่อน
+                config = JsonSerializer.Deserialize<AppConfig>(rawText, new JsonSerializerOptions
+                {
+                    ReadCommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true
+                });
+            }
+            catch
+            {
+                // ถ้าติดเรื่อง Slash เดี่ยว (\) จากการ Copy as path ให้ใช้ระบบ Fallback Parser อัตโนมัติ
+                config = ParseConfigManually(rawText);
+            }
+
+            if (config == null)
+            {
+                config = new AppConfig();
+            }
+
+            // ทำความสะอาด Path (ตัดเครื่องหมายคำพูดคู่ " " ออกถ้าผู้ใช้เผลอก๊อปมาติด)
+            config.TargetPath = CleanPath(config.TargetPath);
+            config.WorkingDirectory = CleanPath(config.WorkingDirectory);
+            config.CustomIconPath = CleanPath(config.CustomIconPath);
+
+            // ถ้าไม่ได้กำหนด WorkingDirectory ให้คำนวณจาก TargetPath อัตโนมัติ
+            if (string.IsNullOrWhiteSpace(config.WorkingDirectory) && !string.IsNullOrWhiteSpace(config.TargetPath))
+            {
+                try
+                {
+                    string dir = Path.GetDirectoryName(Path.GetFullPath(config.TargetPath));
+                    if (!string.IsNullOrWhiteSpace(dir))
+                    {
+                        config.WorkingDirectory = dir;
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static AppConfig ParseConfigManually(string text)
+        {
+            var cfg = new AppConfig();
+
+            string ExtractValue(string key)
+            {
+                var match = Regex.Match(text, $@"""{key}""\s*:\s*""?([^"",\r\n}}]+)""?", RegexOptions.IgnoreCase);
+                return match.Success ? match.Groups[1].Value.Trim() : null;
+            }
+
+            bool ExtractBool(string key, bool defaultVal)
+            {
+                var val = ExtractValue(key);
+                if (val != null && bool.TryParse(val, out bool b)) return b;
+                return defaultVal;
+            }
+
+            cfg.TargetPath = ExtractValue("TargetPath") ?? cfg.TargetPath;
+            cfg.Arguments = ExtractValue("Arguments") ?? "";
+            cfg.WorkingDirectory = ExtractValue("WorkingDirectory") ?? "";
+            cfg.TrayTooltip = ExtractValue("TrayTooltip") ?? "Print Center Service";
+            cfg.CustomIconPath = ExtractValue("CustomIconPath") ?? "";
+            cfg.ExitPassword = ExtractValue("ExitPassword") ?? "";
+            cfg.HideWindow = ExtractBool("HideWindow", true);
+            cfg.AutoRestartOnCrash = ExtractBool("AutoRestartOnCrash", false);
+
+            return cfg;
+        }
+
+        private static string CleanPath(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return "";
+            return path.Trim().Trim('\"', '\'');
+        }
+
+        private static void SaveConfig()
+        {
+            try
+            {
+                string json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(ConfigPath, json);
+            }
+            catch { }
         }
 
         private static void InitTrayIcon()
@@ -183,7 +249,6 @@ namespace TrayWrapperApp
 
                     var runtime = DateTime.Now - processStartTime;
 
-                    // ป้องกัน loop ถ้าไฟล์ทำงานเสร็จเร็ว หรือ AutoRestart เป็น false
                     if (!config.AutoRestartOnCrash || runtime.TotalSeconds < 10)
                     {
                         return;
@@ -247,15 +312,10 @@ namespace TrayWrapperApp
 
         private static void HandleExitRequest()
         {
-            // ถ้ามีการตั้งรหัสผ่านไว้
             if (!string.IsNullOrEmpty(config.ExitPassword))
             {
                 string input = PromptPasswordDialog("กรุณากรอกรหัสผ่านเพื่อปิดโปรแกรม:", "ยืนยันการปิด Service");
-                if (input == null)
-                {
-                    // ผู้ใช้กด Cancel
-                    return;
-                }
+                if (input == null) return;
 
                 if (input != config.ExitPassword)
                 {
@@ -264,7 +324,6 @@ namespace TrayWrapperApp
                 }
             }
 
-            // ถ้าผ่านรหัสผ่าน หรือไม่ได้ตั้งรหัสไว้
             ExitApplication();
         }
 
