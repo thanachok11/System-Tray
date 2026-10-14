@@ -105,7 +105,26 @@ namespace TrayWrapperApp
         private static List<ManagedApp> managedApps = new List<ManagedApp>();
         private static bool isManualExit = false;
 
-        private static readonly string ConfigPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+        private static string GetConfigPath()
+        {
+            try
+            {
+                string? exePath = Environment.ProcessPath;
+                if (!string.IsNullOrEmpty(exePath))
+                {
+                    string? dir = Path.GetDirectoryName(exePath);
+                    if (!string.IsNullOrEmpty(dir))
+                    {
+                        return Path.Combine(dir, "config.json");
+                    }
+                }
+            }
+            catch { }
+
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+        }
+
+        private static readonly string ConfigPath = GetConfigPath();
 
         [STAThread]
         static void Main(string[] args)
@@ -117,7 +136,6 @@ namespace TrayWrapperApp
                 return;
             }
 
-            // ซ่อมแซมและเติม System PATH เผื่อตอนรันตอน Auto-Start แล้ว PATH ยังไม่สมบูรณ์
             EnsureSystemPath();
 
             Application.EnableVisualStyles();
@@ -172,8 +190,8 @@ namespace TrayWrapperApp
         {
             try
             {
-                string sys32 = Environment.GetFolderPath(Environment.SpecialFolder.System); // C:\Windows\System32
-                string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows); // C:\Windows
+                string sys32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
+                string winDir = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
                 string wbem = Path.Combine(sys32, "wbem");
                 string powershell = Path.Combine(sys32, "WindowsPowerShell", "v1.0");
 
@@ -201,19 +219,46 @@ namespace TrayWrapperApp
 
             string rawText = File.ReadAllText(ConfigPath);
 
+            // ปรับแก้ JSON อัตโนมัติ: ถ้ามี Windows backslash เดี่ยว ให้ sanitize ป้องกัน Deserialize พัง
+            string sanitizedJson = SanitizeJsonBackslashes(rawText);
+
+            bool loadSuccess = false;
             try
             {
-                config = JsonSerializer.Deserialize<AppConfig>(rawText, new JsonSerializerOptions
+                var options = new JsonSerializerOptions
                 {
                     ReadCommentHandling = JsonCommentHandling.Skip,
-                    AllowTrailingCommas = true
-                }) ?? new AppConfig();
+                    AllowTrailingCommas = true,
+                    PropertyNameCaseInsensitive = true
+                };
+
+                var parsed = JsonSerializer.Deserialize<AppConfig>(sanitizedJson, options);
+                if (parsed != null)
+                {
+                    config = parsed;
+                    loadSuccess = true;
+                }
             }
-            catch
+            catch (Exception ex)
             {
-                config = new AppConfig();
+                // หาก Deserialize แบบมาตรฐานพัง ให้ใช้ Manual Parser ดึงค่าออกมา ห้าม overwrite ไฟล์ทิ้งเด็ดขาด!
+                config = ParseConfigManually(rawText);
+                if (config.Programs.Count > 0 || !string.IsNullOrWhiteSpace(config.TargetPath))
+                {
+                    loadSuccess = true;
+                }
+                else
+                {
+                    MessageBox.Show(
+                        $"ไม่สามารถอ่านไฟล์ config.json ได้:\n{ex.Message}\n\nกรุณาตรวจสอบว่ามีเครื่องหมายผิดไวยากรณ์หรือไม่ ที่: {ConfigPath}",
+                        "TrayWrapper Config Error",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning
+                    );
+                }
             }
 
+            // รองรับ format เดี่ยวแบบเดิม
             if (config.Programs == null || config.Programs.Count == 0)
             {
                 if (!string.IsNullOrWhiteSpace(config.TargetPath))
@@ -222,7 +267,7 @@ namespace TrayWrapperApp
                     {
                         new ProgramItemConfig
                         {
-                            Name = "Service 1",
+                            Name = Path.GetFileNameWithoutExtension(config.TargetPath) ?? "Service",
                             TargetPath = CleanPath(config.TargetPath),
                             Arguments = config.Arguments ?? "",
                             WorkingDirectory = CleanPath(config.WorkingDirectory ?? ""),
@@ -230,11 +275,6 @@ namespace TrayWrapperApp
                             AutoRestartOnCrash = config.AutoRestartOnCrash ?? false
                         }
                     };
-                }
-                else
-                {
-                    CreateDefaultConfig();
-                    return;
                 }
             }
 
@@ -258,6 +298,83 @@ namespace TrayWrapperApp
             }
         }
 
+        /// <summary>
+        /// แปลง single backslash ใน string value ให้เป็น escaped backslash ป้องกัน JSON parser พัง
+        /// </summary>
+        private static string SanitizeJsonBackslashes(string json)
+        {
+            try
+            {
+                // จับเฉพาะข้อความข้างในเครื่องหมายคำพูด "..." แล้วแก้ \ เดี่ยวให้เป็น \\
+                return Regex.Replace(json, @"""((?:\\.|[^""\\])*)""", m =>
+                {
+                    string content = m.Groups[1].Value;
+                    // ถ้ามี Windows path เช่น C:\folder ให้ sanitize
+                    // แทนที่ \ เดี่ยวที่ไม่ใช่ escape ทั่วไป
+                    string fixedContent = Regex.Replace(content, @"(?<!\\)\\(?![""\\/bfnrtu])", @"\\");
+                    return $"\"{fixedContent}\"";
+                });
+            }
+            catch
+            {
+                return json;
+            }
+        }
+
+        private static AppConfig ParseConfigManually(string text)
+        {
+            var cfg = new AppConfig();
+
+            try
+            {
+                // ค้นหา Programs array บล็อก
+                var progMatches = Regex.Matches(text, @"\{[^{}]*""TargetPath""[^{}]*\}", RegexOptions.Singleline);
+                foreach (Match m in progMatches)
+                {
+                    string block = m.Value;
+                    string name = ExtractRegexValue(block, "Name") ?? "Service";
+                    string target = ExtractRegexValue(block, "TargetPath") ?? "";
+                    string args = ExtractRegexValue(block, "Arguments") ?? "";
+                    string workDir = ExtractRegexValue(block, "WorkingDirectory") ?? "";
+                    bool hide = ExtractRegexBool(block, "HideWindow", true);
+                    bool autoRestart = ExtractRegexBool(block, "AutoRestartOnCrash", false);
+
+                    if (!string.IsNullOrWhiteSpace(target))
+                    {
+                        cfg.Programs.Add(new ProgramItemConfig
+                        {
+                            Name = name,
+                            TargetPath = target,
+                            Arguments = args,
+                            WorkingDirectory = workDir,
+                            HideWindow = hide,
+                            AutoRestartOnCrash = autoRestart
+                        });
+                    }
+                }
+
+                cfg.TrayTooltip = ExtractRegexValue(text, "TrayTooltip") ?? "Print Center & Background Services";
+                cfg.CustomIconPath = ExtractRegexValue(text, "CustomIconPath") ?? "";
+                cfg.ExitPassword = ExtractRegexValue(text, "ExitPassword") ?? "";
+            }
+            catch { }
+
+            return cfg;
+        }
+
+        private static string? ExtractRegexValue(string block, string key)
+        {
+            var m = Regex.Match(block, $@"""{key}""\s*:\s*""([^""]*)""", RegexOptions.IgnoreCase);
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        private static bool ExtractRegexBool(string block, string key, bool defaultVal)
+        {
+            var m = Regex.Match(block, $@"""{key}""\s*:\s*(true|false)", RegexOptions.IgnoreCase);
+            if (m.Success && bool.TryParse(m.Groups[1].Value, out bool b)) return b;
+            return defaultVal;
+        }
+
         private static void CreateDefaultConfig()
         {
             config = new AppConfig
@@ -265,36 +382,10 @@ namespace TrayWrapperApp
                 TrayTooltip = "Print Center & Background Services",
                 CustomIconPath = "",
                 ExitPassword = "",
-                Programs = new List<ProgramItemConfig>
-                {
-                    new ProgramItemConfig
-                    {
-                        Name = "Print Center Timer",
-                        TargetPath = @"C:\appsoft\bin\AutoStartPrintCenter\AutoStartDevPrintCenterTimer.bat",
-                        Arguments = "",
-                        WorkingDirectory = @"C:\appsoft\bin\AutoStartPrintCenter",
-                        HideWindow = true,
-                        AutoRestartOnCrash = false
-                    },
-                    new ProgramItemConfig
-                    {
-                        Name = "Dev Cmd Timer",
-                        TargetPath = @"C:\appsoft\bin\AutoStartDevCmdTimer.bat",
-                        Arguments = "",
-                        WorkingDirectory = @"C:\appsoft\bin",
-                        HideWindow = true,
-                        AutoRestartOnCrash = false
-                    }
-                }
+                Programs = new List<ProgramItemConfig>()
             };
 
             SaveConfig();
-
-            managedApps.Clear();
-            foreach (var p in config.Programs)
-            {
-                managedApps.Add(new ManagedApp(p));
-            }
         }
 
         private static string CleanPath(string path)
@@ -326,10 +417,16 @@ namespace TrayWrapperApp
                 try { icon = Icon.ExtractAssociatedIcon(managedApps[0].Config.TargetPath) ?? SystemIcons.Application; } catch { }
             }
 
+            string tooltip = config.TrayTooltip;
+            if (managedApps.Count == 1 && !string.IsNullOrWhiteSpace(managedApps[0].Config.Name))
+            {
+                tooltip = $"{managedApps[0].Config.Name} (Running)";
+            }
+
             trayIcon = new NotifyIcon
             {
                 Icon = icon,
-                Text = config.TrayTooltip.Length > 63 ? config.TrayTooltip.Substring(0, 63) : config.TrayTooltip,
+                Text = tooltip.Length > 63 ? tooltip.Substring(0, 63) : tooltip,
                 Visible = true
             };
 
@@ -351,13 +448,19 @@ namespace TrayWrapperApp
             contextMenu.Items.Add(restartAllItem);
             contextMenu.Items.Add(new ToolStripSeparator());
 
-            // เมนูย่อยสำหรับแต่ละโปรแกรม
+            // เมนูย่อยสำหรับแต่ละโปรแกรม พร้อมแสดง Path ที่ใช้งานอยู่
             for (int i = 0; i < managedApps.Count; i++)
             {
                 var app = managedApps[i];
                 string displayName = string.IsNullOrWhiteSpace(app.Config.Name) ? $"โปรแกรม {i + 1}" : app.Config.Name;
 
                 var subMenu = new ToolStripMenuItem($"⚙️ {displayName}");
+                
+                string targetFileName = Path.GetFileName(app.Config.TargetPath);
+                var targetInfoItem = new ToolStripMenuItem($"📄 {targetFileName}") { Enabled = false };
+                subMenu.DropDownItems.Add(targetInfoItem);
+                subMenu.DropDownItems.Add(new ToolStripSeparator());
+
                 subMenu.DropDownItems.Add(new ToolStripMenuItem("👁️ แสดง / ซ่อน หน้าต่าง", null, (s, e) => ToggleSingleAppWindow(app)));
                 subMenu.DropDownItems.Add(new ToolStripMenuItem("🔄 Restart โปรแกรมนี้", null, (s, e) => RestartSingleProcess(app)));
                 subMenu.DropDownItems.Add(new ToolStripMenuItem("🎯 เปลี่ยนไฟล์โปรแกรมนี้...", null, (s, e) => PromptChangeAppTarget(app)));
@@ -368,7 +471,7 @@ namespace TrayWrapperApp
 
             contextMenu.Items.Add(new ToolStripSeparator());
             contextMenu.Items.Add(new ToolStripMenuItem("➕ เพิ่มโปรแกรมใหม่...", null, (s, e) => PromptAddNewProgram()));
-            contextMenu.Items.Add(new ToolStripMenuItem("📝 แก้ไข config.json", null, (s, e) => OpenConfigFile()));
+            contextMenu.Items.Add(new ToolStripMenuItem("📝 เปิดแก้ไข config.json", null, (s, e) => OpenConfigFile()));
             contextMenu.Items.Add(new ToolStripSeparator());
             contextMenu.Items.Add(new ToolStripMenuItem("❌ ปิดโปรแกรมทั้งหมด (Exit)", null, (s, e) => HandleExitRequest()));
 
@@ -434,6 +537,10 @@ namespace TrayWrapperApp
                 {
                     Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = $"\"{ConfigPath}\"", UseShellExecute = true });
                 }
+                else
+                {
+                    MessageBox.Show($"ไม่พบไฟล์ config.json ที่:\n{ConfigPath}", "Notice", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
             }
             catch { }
         }
@@ -450,8 +557,14 @@ namespace TrayWrapperApp
         {
             try
             {
-                if (string.IsNullOrWhiteSpace(app.Config.TargetPath) || !File.Exists(app.Config.TargetPath))
+                if (string.IsNullOrWhiteSpace(app.Config.TargetPath))
                 {
+                    return;
+                }
+
+                if (!File.Exists(app.Config.TargetPath))
+                {
+                    trayIcon?.ShowBalloonTip(4000, "Tray Wrapper Warning", $"ไม่พบไฟล์เป้าหมาย:\n{app.Config.TargetPath}", ToolTipIcon.Warning);
                     return;
                 }
 
