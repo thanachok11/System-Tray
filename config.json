@@ -1,23 +1,16 @@
 {
-  "TrayTooltip": "Print Center & Background Services",
+  "TrayTooltip": "DxRunner Print Center Service",
   "CustomIconPath": "",
-  "ExitPassword": "",
+  "ExitPassword": "1234",
   "Programs": [
     {
-      "Name": "Print Center Timer",
-      "TargetPath": "C:\\appsoft\\bin\\AutoStartPrintCenter\\AutoStartDevPrintCenterTimer.bat",
-      "Arguments": "",
-      "WorkingDirectory": "C:\\appsoft\\bin\\AutoStartPrintCenter",
+      "Name": "DxRunner Print Center",
+      "TargetPath": "C:\\AppSoft\\bin\\DxRunner.exe",
+      "Arguments": "\"HIDE_BAT_AUTO_ComputerName=COM1,PrintOrder=39|40,TimerSec=15\"",
+      "WorkingDirectory": "C:\\AppSoft\\bin",
       "HideWindow": true,
-      "AutoRestartOnCrash": false
-    },
-    {
-      "Name": "Dev Cmd Timer",
-      "TargetPath": "C:\\appsoft\\bin\\AutoStartDevCmdTimer.bat",
-      "Arguments": "",
-      "WorkingDirectory": "C:\\appsoft\\bin",
-      "HideWindow": true,
-      "AutoRestartOnCrash": false
+      "AutoRestartOnCrash": false,
+      "CustomConfigPath": ""
     }
   ]
 }
