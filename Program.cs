@@ -264,7 +264,6 @@ namespace TrayWrapperApp
                 config = ParseConfigManually(rawText);
             }
 
-            // รองรับ format เดี่ยวแบบเดิม
             if (config.Programs == null || config.Programs.Count == 0)
             {
                 if (!string.IsNullOrWhiteSpace(config.TargetPath))
@@ -421,13 +420,15 @@ namespace TrayWrapperApp
         }
 
         /// <summary>
-        /// สกัดอ่านไฟล์ Logo/Icon จริงๆ ของโปรแกรม (.exe, .lnk หรือ .ico)
+        /// สกัดอ่านไฟล์ Logo/Icon จริงๆ ของโปรแกรม (.exe, .lnk หรือรูป .png, .jpg, .ico)
         /// </summary>
         private static Icon GetAppIcon(string? targetPath, string? customIconPath)
         {
+            // 1. ตรวจสอบ CustomIconPath ก่อน (รองรับทั้ง .ico และไฟล์รูป .png, .jpg, .bmp)
             if (!string.IsNullOrEmpty(customIconPath) && File.Exists(customIconPath))
             {
-                try { return new Icon(customIconPath); } catch { }
+                var custom = LoadImageAsIcon(customIconPath);
+                if (custom != null) return custom;
             }
 
             if (string.IsNullOrWhiteSpace(targetPath)) return SystemIcons.Application;
@@ -462,6 +463,15 @@ namespace TrayWrapperApp
 
             if (File.Exists(resolvedPath))
             {
+                // ตรวจสอบว่าเป็นรูปภาพหรือไม่
+                string resExt = Path.GetExtension(resolvedPath).ToLower();
+                if (resExt == ".png" || resExt == ".jpg" || resExt == ".jpeg" || resExt == ".bmp" || resExt == ".ico")
+                {
+                    var imgIcon = LoadImageAsIcon(resolvedPath);
+                    if (imgIcon != null) return imgIcon;
+                }
+
+                // สกัด Icon จาก Windows Shell API
                 try
                 {
                     SHFILEINFO shinfo = new SHFILEINFO();
@@ -486,13 +496,43 @@ namespace TrayWrapperApp
             return SystemIcons.Application;
         }
 
+        /// <summary>
+        /// แปลงไฟล์รูปภาพ เช่น .png, .jpg, .ico ให้เป็น Icon 32x32 อย่างคมชัด
+        /// </summary>
+        private static Icon? LoadImageAsIcon(string filePath)
+        {
+            try
+            {
+                string ext = Path.GetExtension(filePath).ToLower();
+                if (ext == ".ico")
+                {
+                    return new Icon(filePath);
+                }
+
+                if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp")
+                {
+                    using (Bitmap original = new Bitmap(filePath))
+                    using (Bitmap resized = new Bitmap(original, new Size(32, 32)))
+                    {
+                        IntPtr hIcon = resized.GetHicon();
+                        Icon icon = (Icon)Icon.FromHandle(hIcon).Clone();
+                        DestroyIcon(hIcon);
+                        return icon;
+                    }
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
         private static void InitTrayIcon()
         {
             Icon icon = SystemIcons.Application;
 
             if (!string.IsNullOrEmpty(config.CustomIconPath) && File.Exists(config.CustomIconPath))
             {
-                try { icon = new Icon(config.CustomIconPath); } catch { }
+                icon = LoadImageAsIcon(config.CustomIconPath) ?? SystemIcons.Application;
             }
             else if (managedApps.Count > 0)
             {
@@ -530,7 +570,6 @@ namespace TrayWrapperApp
             contextMenu.Items.Add(restartAllItem);
             contextMenu.Items.Add(new ToolStripSeparator());
 
-            // เมนูย่อยสำหรับแต่ละโปรแกรม พร้อมแสดง Logo จริงของโปรแกรมนั้น
             for (int i = 0; i < managedApps.Count; i++)
             {
                 var app = managedApps[i];
@@ -566,14 +605,12 @@ namespace TrayWrapperApp
         {
             try
             {
-                // 1. ถ้ามีระบุ CustomConfigPath ไว้
                 if (!string.IsNullOrWhiteSpace(app.Config.CustomConfigPath) && File.Exists(app.Config.CustomConfigPath))
                 {
                     Process.Start(new ProcessStartInfo { FileName = "notepad.exe", Arguments = $"\"{app.Config.CustomConfigPath}\"", UseShellExecute = true });
                     return;
                 }
 
-                // 2. ค้นหาไฟล์ config อัตโนมัติในโฟลเดอร์ของโปรแกรม
                 string dir = !string.IsNullOrWhiteSpace(app.Config.WorkingDirectory) && Directory.Exists(app.Config.WorkingDirectory)
                     ? app.Config.WorkingDirectory
                     : Path.GetDirectoryName(Path.GetFullPath(app.Config.TargetPath)) ?? "";
@@ -606,7 +643,6 @@ namespace TrayWrapperApp
                         }
                     }
 
-                    // หาไฟล์นามสกุล config, ini, json ในโฟลเดอร์นั้น
                     var otherConfigs = Directory.GetFiles(dir, "*.config")
                         .Concat(Directory.GetFiles(dir, "*.ini"))
                         .Concat(Directory.GetFiles(dir, "*.json"))
@@ -622,7 +658,6 @@ namespace TrayWrapperApp
                     }
                 }
 
-                // 3. ถ้าหาไม่เจอ ให้เปิดกล่องเลือกไฟล์ config
                 using (OpenFileDialog ofd = new OpenFileDialog())
                 {
                     ofd.Title = $"เลือกไฟล์ Config สำหรับ {app.Config.Name}";
