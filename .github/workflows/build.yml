@@ -56,5 +56,6 @@ jobs:
             4. ดับเบิ้ลคลิก `TrayWrapperApp.exe` ใช้งานได้ทันที
           files: |
             ./TrayWrapperApp-Windows-x64.zip
+            ./publish/TrayWrapperApp.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

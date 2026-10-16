@@ -11,6 +11,8 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.IO.Compression;
+using System.Net.Http;
 
 namespace TrayWrapperApp
 {
@@ -31,6 +33,8 @@ namespace TrayWrapperApp
         public string TrayTooltip { get; set; } = "DxRunner Print Center Service";
         public string CustomIconPath { get; set; } = "";
         public string ExitPassword { get; set; } = "1234";
+        public bool AutoCheckUpdateOnStartup { get; set; } = false;
+        public string GitRepo { get; set; } = "thanachok11/System-Tray";
         public List<ProgramItemConfig> Programs { get; set; } = new List<ProgramItemConfig>();
 
         // Backward compatibility
@@ -46,6 +50,7 @@ namespace TrayWrapperApp
         public ProgramItemConfig Config { get; set; }
         public Process? ChildProcess { get; set; }
         public IntPtr WindowHandle { get; set; } = IntPtr.Zero;
+        public HashSet<IntPtr> WindowHandles { get; set; } = new HashSet<IntPtr>();
         public bool IsWindowShown { get; set; } = false;
         public int SpawnedPid { get; set; } = 0;
         public DateTime StartTime { get; set; }
@@ -68,6 +73,9 @@ namespace TrayWrapperApp
 
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
@@ -95,6 +103,45 @@ namespace TrayWrapperApp
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool DestroyIcon(IntPtr hIcon);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+        private static extern bool FreeConsole();
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetConsoleWindow();
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct PROCESSENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        private const uint TH32CS_SNAPPROCESS = 0x00000002;
 
         private const uint SHGFI_ICON = 0x000000100;
         private const uint SHGFI_SMALLICON = 0x000000001;
@@ -195,6 +242,15 @@ namespace TrayWrapperApp
             }
 
             InitTrayIcon();
+
+            if (config.AutoCheckUpdateOnStartup)
+            {
+                Task.Run(async () =>
+                {
+                    await Task.Delay(4000);
+                    await CheckAndPerformGitUpdate(false);
+                });
+            }
 
             if (managedApps.Count == 0)
             {
@@ -358,6 +414,8 @@ namespace TrayWrapperApp
                 cfg.TrayTooltip = ExtractRegexValue(text, "TrayTooltip") ?? "DxRunner Print Center Service";
                 cfg.CustomIconPath = ExtractRegexValue(text, "CustomIconPath") ?? "";
                 cfg.ExitPassword = ExtractRegexValue(text, "ExitPassword") ?? "1234";
+                cfg.AutoCheckUpdateOnStartup = ExtractRegexBool(text, "AutoCheckUpdateOnStartup", false);
+                cfg.GitRepo = ExtractRegexValue(text, "GitRepo") ?? "thanachok11/System-Tray";
             }
             catch { }
 
@@ -384,6 +442,8 @@ namespace TrayWrapperApp
                 TrayTooltip = "DxRunner Print Center Service",
                 CustomIconPath = "",
                 ExitPassword = "1234",
+                AutoCheckUpdateOnStartup = false,
+                GitRepo = "thanachok11/System-Tray",
                 Programs = new List<ProgramItemConfig>
                 {
                     new ProgramItemConfig
@@ -593,6 +653,7 @@ namespace TrayWrapperApp
             }
 
             contextMenu.Items.Add(new ToolStripSeparator());
+            contextMenu.Items.Add(new ToolStripMenuItem("🚀 อัปเดตโปรแกรมจาก Git / GitHub...", null, (s, e) => _ = CheckAndPerformGitUpdate(true)));
             contextMenu.Items.Add(new ToolStripMenuItem("➕ เพิ่มโปรแกรมใหม่...", null, (s, e) => PromptAddNewProgram()));
             contextMenu.Items.Add(new ToolStripMenuItem("📝 เปิดแก้ไข config.json (TrayWrapper)", null, (s, e) => OpenConfigFile()));
             contextMenu.Items.Add(new ToolStripSeparator());
@@ -779,7 +840,9 @@ namespace TrayWrapperApp
                     string sys32 = Environment.GetFolderPath(Environment.SpecialFolder.System);
                     string cmdExePath = Path.Combine(sys32, "cmd.exe");
                     psi.FileName = File.Exists(cmdExePath) ? cmdExePath : "cmd.exe";
-                    psi.Arguments = $"/k \"\"{target}\" {args}\"";
+                    string winTitle = string.IsNullOrWhiteSpace(app.Config.Name) ? Path.GetFileNameWithoutExtension(target) : app.Config.Name;
+                    string formattedArgs = string.IsNullOrWhiteSpace(args) ? $"\"\"{target}\"\"" : $"\"\"{target}\" {args}\"";
+                    psi.Arguments = $"/k \"title {winTitle} & {formattedArgs}\"";
                 }
                 else if (ext == ".lnk")
                 {
@@ -849,25 +912,45 @@ namespace TrayWrapperApp
                 Task.Run(async () =>
                 {
                     app.WindowHandle = IntPtr.Zero;
+                    app.WindowHandles.Clear();
 
-                    for (int i = 0; i < 25; i++)
+                    // ค้นหาและซ่อนหน้าต่างอย่างต่อเนื่องนานสูงสุดประมาณ 12 วินาที (ครอบคลุมทั้ง CMD และ Child Process)
+                    for (int i = 0; i < 40; i++)
                     {
-                        await Task.Delay(100);
-                        app.WindowHandle = FindProcessWindow(app);
-                        if (app.WindowHandle != IntPtr.Zero)
+                        await Task.Delay(i < 15 ? 100 : 250);
+
+                        var foundWindows = FindAllProcessWindows(app);
+                        if (foundWindows.Count > 0)
                         {
-                            DisableCloseButton(app.WindowHandle);
+                            foreach (var hWnd in foundWindows)
+                            {
+                                if (app.WindowHandles.Add(hWnd))
+                                {
+                                    DisableCloseButton(hWnd);
+
+                                    if (app.Config.HideWindow)
+                                    {
+                                        ShowWindow(hWnd, SW_HIDE);
+                                    }
+                                }
+                            }
+
+                            app.WindowHandle = app.WindowHandles.FirstOrDefault();
 
                             if (app.Config.HideWindow)
                             {
-                                ShowWindow(app.WindowHandle, SW_HIDE);
                                 app.IsWindowShown = false;
                             }
                             else
                             {
                                 app.IsWindowShown = true;
                             }
-                            break;
+
+                            // หากเป็น .exe ปกติและพบหน้าต่างพร้อมยืนยันซ่อนแล้ว ให้จบ loop ได้เร็วขึ้น
+                            if (ext == ".exe" && app.WindowHandles.Count > 0 && i >= 10)
+                            {
+                                break;
+                            }
                         }
                     }
                 });
@@ -893,34 +976,145 @@ namespace TrayWrapperApp
             catch { }
         }
 
-        private static IntPtr FindProcessWindow(ManagedApp app)
+        /// <summary>
+        /// ดึงรายการ Process ID ทั้งหมดในต้นไม้ (Root Process + conhost.exe + Child Processes ทั้งหมด)
+        /// </summary>
+        private static HashSet<uint> GetProcessTreePids(int rootPid)
         {
-            if (app.ChildProcess != null)
+            var pids = new HashSet<uint>();
+            if (rootPid <= 0) return pids;
+
+            pids.Add((uint)rootPid);
+
+            IntPtr handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (handle == IntPtr.Zero || handle == new IntPtr(-1))
+            {
+                return pids;
+            }
+
+            try
+            {
+                var parentToChildren = new Dictionary<uint, List<uint>>();
+                PROCESSENTRY32 pe = new PROCESSENTRY32();
+                pe.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+
+                if (Process32First(handle, ref pe))
+                {
+                    do
+                    {
+                        uint pId = pe.th32ProcessID;
+                        uint parentId = pe.th32ParentProcessID;
+
+                        if (!parentToChildren.TryGetValue(parentId, out var list))
+                        {
+                            list = new List<uint>();
+                            parentToChildren[parentId] = list;
+                        }
+                        list.Add(pId);
+                    }
+                    while (Process32Next(handle, ref pe));
+                }
+
+                var queue = new Queue<uint>();
+                queue.Enqueue((uint)rootPid);
+
+                while (queue.Count > 0)
+                {
+                    uint curr = queue.Dequeue();
+                    if (parentToChildren.TryGetValue(curr, out var children))
+                    {
+                        foreach (var child in children)
+                        {
+                            if (pids.Add(child))
+                            {
+                                queue.Enqueue(child);
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                CloseHandle(handle);
+            }
+
+            return pids;
+        }
+
+        /// <summary>
+        /// ใช้ AttachConsole Win32 API เพื่อหา Handle ของหน้าต่าง Console/CMD ของ process นั้นๆ อย่างแม่นยำ
+        /// </summary>
+        private static IntPtr GetConsoleWindowForProcess(uint pid)
+        {
+            if (pid == 0) return IntPtr.Zero;
+            try
+            {
+                FreeConsole();
+                if (AttachConsole(pid))
+                {
+                    IntPtr hWnd = GetConsoleWindow();
+                    FreeConsole();
+                    if (hWnd != IntPtr.Zero && IsWindow(hWnd))
+                    {
+                        return hWnd;
+                    }
+                }
+            }
+            catch { }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// ค้นหาหน้าต่างทั้งหมดที่เกี่ยวข้องกับโปรแกรมนี้ (ทั้ง Console Window, GUI Window, conhost, และ Child Processes)
+        /// </summary>
+        private static List<IntPtr> FindAllProcessWindows(ManagedApp app)
+        {
+            var windows = new HashSet<IntPtr>();
+            var pids = GetProcessTreePids(app.SpawnedPid);
+
+            // 1. ตรวจสอบ Console Window ผ่าน AttachConsole สำหรับทุก PID ในต้นไม้
+            foreach (uint pid in pids)
+            {
+                IntPtr consoleHwnd = GetConsoleWindowForProcess(pid);
+                if (consoleHwnd != IntPtr.Zero && IsWindow(consoleHwnd))
+                {
+                    windows.Add(consoleHwnd);
+                }
+            }
+
+            // 2. ตรวจสอบ MainWindowHandle ของทุก PID ในต้นไม้
+            foreach (uint pid in pids)
             {
                 try
                 {
-                    app.ChildProcess.Refresh();
-                    if (app.ChildProcess.MainWindowHandle != IntPtr.Zero)
+                    using var p = Process.GetProcessById((int)pid);
+                    if (p.MainWindowHandle != IntPtr.Zero && IsWindow(p.MainWindowHandle))
                     {
-                        return app.ChildProcess.MainWindowHandle;
+                        windows.Add(p.MainWindowHandle);
                     }
                 }
                 catch { }
             }
 
-            IntPtr foundHwnd = IntPtr.Zero;
+            // 3. กวาด EnumWindows เทียบ Process ID ทั้งต้นไม้ และเทียบชื่อ Title
             string targetFileName = Path.GetFileNameWithoutExtension(app.Config.TargetPath);
+            string appName = app.Config.Name;
 
             EnumWindows((hWnd, lParam) =>
             {
+                if (!IsWindow(hWnd)) return true;
+
                 GetWindowThreadProcessId(hWnd, out uint procId);
 
-                if (app.SpawnedPid > 0 && procId == app.SpawnedPid)
+                // หากหน้าต่างเป็นของ PID ใดก็ตามใน Process Tree ของโปรแกรมนี้ (รวม conhost.exe และ child processes)
+                if (pids.Contains(procId))
                 {
-                    foundHwnd = hWnd;
-                    return false;
+                    windows.Add(hWnd);
+                    return true;
                 }
 
+                // หากชื่อหน้าต่างตรงกับชื่อโปรแกรม หรือชื่อไฟล์เป้าหมาย
                 int length = GetWindowTextLength(hWnd);
                 if (length > 0)
                 {
@@ -928,17 +1122,25 @@ namespace TrayWrapperApp
                     GetWindowText(hWnd, sb, sb.Capacity);
                     string title = sb.ToString();
 
-                    if (!string.IsNullOrEmpty(targetFileName) && title.IndexOf(targetFileName, StringComparison.OrdinalIgnoreCase) >= 0)
+                    bool matchName = !string.IsNullOrWhiteSpace(appName) && title.IndexOf(appName, StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool matchTarget = !string.IsNullOrWhiteSpace(targetFileName) && title.IndexOf(targetFileName, StringComparison.OrdinalIgnoreCase) >= 0;
+
+                    if (matchName || matchTarget)
                     {
-                        foundHwnd = hWnd;
-                        return false;
+                        windows.Add(hWnd);
                     }
                 }
 
                 return true;
             }, IntPtr.Zero);
 
-            return foundHwnd;
+            return windows.ToList();
+        }
+
+        private static IntPtr FindProcessWindow(ManagedApp app)
+        {
+            var all = FindAllProcessWindows(app);
+            return all.FirstOrDefault();
         }
 
         private static void ToggleAllTargetWindows()
@@ -947,32 +1149,35 @@ namespace TrayWrapperApp
 
             foreach (var app in managedApps)
             {
-                if (app.WindowHandle == IntPtr.Zero) app.WindowHandle = FindProcessWindow(app);
-                if (app.WindowHandle != IntPtr.Zero && IsWindowVisible(app.WindowHandle))
+                var wins = FindAllProcessWindows(app);
+                foreach (var h in wins) app.WindowHandles.Add(h);
+                app.WindowHandles.RemoveWhere(h => !IsWindow(h));
+                app.WindowHandle = app.WindowHandles.FirstOrDefault();
+
+                if (app.WindowHandles.Any(h => IsWindowVisible(h)))
                 {
                     anyVisible = true;
-                    break;
                 }
             }
 
             foreach (var app in managedApps)
             {
-                if (app.WindowHandle == IntPtr.Zero) app.WindowHandle = FindProcessWindow(app);
-                if (app.WindowHandle == IntPtr.Zero) continue;
-
-                DisableCloseButton(app.WindowHandle);
-
-                if (anyVisible)
+                foreach (var hWnd in app.WindowHandles)
                 {
-                    ShowWindow(app.WindowHandle, SW_HIDE);
-                    app.IsWindowShown = false;
-                }
-                else
-                {
-                    ShowWindow(app.WindowHandle, SW_RESTORE);
-                    ShowWindow(app.WindowHandle, SW_SHOW);
-                    SetForegroundWindow(app.WindowHandle);
-                    app.IsWindowShown = true;
+                    DisableCloseButton(hWnd);
+
+                    if (anyVisible)
+                    {
+                        ShowWindow(hWnd, SW_HIDE);
+                        app.IsWindowShown = false;
+                    }
+                    else
+                    {
+                        ShowWindow(hWnd, SW_RESTORE);
+                        ShowWindow(hWnd, SW_SHOW);
+                        SetForegroundWindow(hWnd);
+                        app.IsWindowShown = true;
+                    }
                 }
             }
         }
@@ -981,31 +1186,36 @@ namespace TrayWrapperApp
         {
             try
             {
-                if (app.WindowHandle == IntPtr.Zero)
-                {
-                    app.WindowHandle = FindProcessWindow(app);
-                }
+                var wins = FindAllProcessWindows(app);
+                foreach (var h in wins) app.WindowHandles.Add(h);
+                app.WindowHandles.RemoveWhere(h => !IsWindow(h));
+                app.WindowHandle = app.WindowHandles.FirstOrDefault();
 
-                if (app.WindowHandle == IntPtr.Zero)
+                if (app.WindowHandles.Count == 0)
                 {
                     trayIcon?.ShowBalloonTip(2000, "Tray Wrapper", $"ไม่พบหน้าต่างของ {app.Config.Name}", ToolTipIcon.Info);
                     return;
                 }
 
-                DisableCloseButton(app.WindowHandle);
+                bool anyVisible = app.WindowHandles.Any(h => IsWindowVisible(h));
 
-                if (app.IsWindowShown && IsWindowVisible(app.WindowHandle))
+                foreach (var hWnd in app.WindowHandles)
                 {
-                    ShowWindow(app.WindowHandle, SW_HIDE);
-                    app.IsWindowShown = false;
+                    DisableCloseButton(hWnd);
+
+                    if (anyVisible)
+                    {
+                        ShowWindow(hWnd, SW_HIDE);
+                    }
+                    else
+                    {
+                        ShowWindow(hWnd, SW_RESTORE);
+                        ShowWindow(hWnd, SW_SHOW);
+                        SetForegroundWindow(hWnd);
+                    }
                 }
-                else
-                {
-                    ShowWindow(app.WindowHandle, SW_RESTORE);
-                    ShowWindow(app.WindowHandle, SW_SHOW);
-                    SetForegroundWindow(app.WindowHandle);
-                    app.IsWindowShown = true;
-                }
+
+                app.IsWindowShown = !anyVisible;
             }
             catch (Exception ex)
             {
@@ -1034,6 +1244,7 @@ namespace TrayWrapperApp
             try
             {
                 app.WindowHandle = IntPtr.Zero;
+                app.WindowHandles.Clear();
                 if (app.ChildProcess != null && !app.ChildProcess.HasExited)
                 {
                     app.ChildProcess.Kill(entireProcessTree: true);
@@ -1123,6 +1334,164 @@ namespace TrayWrapperApp
             }
 
             Application.Exit();
+        }
+
+        /// <summary>
+        /// ตรวจสอบและดึงไฟล์อัปเดตล่าสุดจาก Git / GitHub Releases โดยตรง (ไม่แตะต้อง config.json เดิม)
+        /// </summary>
+        private static async Task CheckAndPerformGitUpdate(bool isManual)
+        {
+            try
+            {
+                if (isManual)
+                {
+                    trayIcon?.ShowBalloonTip(2000, "Git Update", "กำลังตรวจสอบเวอร์ชันล่าสุดจาก Git...", ToolTipIcon.Info);
+                }
+
+                string repo = string.IsNullOrWhiteSpace(config.GitRepo) ? "thanachok11/System-Tray" : config.GitRepo.Trim();
+                string apiUrl = $"https://api.github.com/repos/{repo}/releases/latest";
+
+                using var client = new HttpClient();
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("TrayWrapperApp-GitUpdater");
+                client.Timeout = TimeSpan.FromSeconds(15);
+
+                var response = await client.GetAsync(apiUrl);
+                if (!response.IsSuccessStatusCode)
+                {
+                    if (isManual)
+                    {
+                        MessageBox.Show($"ไม่สามารถเชื่อมต่อ Git Release ได้ (HTTP {response.StatusCode})\nกรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ต", "Git Update Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    }
+                    return;
+                }
+
+                string json = await response.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                string tagName = root.TryGetProperty("tag_name", out var t) ? t.GetString() ?? "latest" : "latest";
+                string publishedAt = root.TryGetProperty("published_at", out var p) ? p.GetString() ?? "" : "";
+
+                string downloadUrl = "";
+                bool isZip = false;
+
+                if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var asset in assets.EnumerateArray())
+                    {
+                        string name = asset.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                        string url = asset.TryGetProperty("browser_download_url", out var u) ? u.GetString() ?? "" : "";
+
+                        if (name.Equals("TrayWrapperApp.exe", StringComparison.OrdinalIgnoreCase))
+                        {
+                            downloadUrl = url;
+                            isZip = false;
+                            break;
+                        }
+                        else if (name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(downloadUrl))
+                        {
+                            downloadUrl = url;
+                            isZip = true;
+                        }
+                    }
+                }
+
+                if (string.IsNullOrEmpty(downloadUrl))
+                {
+                    downloadUrl = $"https://github.com/{repo}/releases/latest/download/TrayWrapperApp.exe";
+                }
+
+                DateTime releaseDate = DateTime.MinValue;
+                if (!string.IsNullOrEmpty(publishedAt))
+                {
+                    DateTime.TryParse(publishedAt, out releaseDate);
+                }
+
+                string currentExePath = Environment.ProcessPath ?? Application.ExecutablePath;
+                DateTime currentExeDate = File.GetLastWriteTimeUtc(currentExePath);
+
+                if (!isManual)
+                {
+                    if (releaseDate != DateTime.MinValue && releaseDate <= currentExeDate.AddMinutes(5))
+                    {
+                        return;
+                    }
+                }
+
+                string dateText = releaseDate != DateTime.MinValue ? releaseDate.ToLocalTime().ToString("dd/MM/yyyy HH:mm") : "ล่าสุด";
+                var dr = MessageBox.Show(
+                    $"พบเวอร์ชันใหม่บน Git!\n\n" +
+                    $"• เวอร์ชัน / Release: {tagName}\n" +
+                    $"• วันที่ปล่อย: {dateText}\n\n" +
+                    $"คุณต้องการดาวน์โหลดและอัปเดตทันทีหรือไม่?\n(ไฟล์ config.json และการตั้งค่าเดิมจะไม่หาย)",
+                    "ยืนยันการอัปเดตจาก Git",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+
+                if (dr != DialogResult.Yes) return;
+
+                trayIcon?.ShowBalloonTip(3000, "Git Update", "กำลังดาวน์โหลดไฟล์อัปเดตจาก Git...", ToolTipIcon.Info);
+
+                string appDir = Path.GetDirectoryName(currentExePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+                string tempExe = Path.Combine(appDir, "TrayWrapperApp.new.exe");
+
+                if (isZip)
+                {
+                    string tempZip = Path.Combine(appDir, "update.zip");
+                    var zipBytes = await client.GetByteArrayAsync(downloadUrl);
+                    await File.WriteAllBytesAsync(tempZip, zipBytes);
+
+                    using (var archive = ZipFile.OpenRead(tempZip))
+                    {
+                        var entry = archive.Entries.FirstOrDefault(e => e.Name.Equals("TrayWrapperApp.exe", StringComparison.OrdinalIgnoreCase));
+                        if (entry != null)
+                        {
+                            entry.ExtractToFile(tempExe, true);
+                        }
+                    }
+                    try { File.Delete(tempZip); } catch { }
+                }
+                else
+                {
+                    var exeBytes = await client.GetByteArrayAsync(downloadUrl);
+                    await File.WriteAllBytesAsync(tempExe, exeBytes);
+                }
+
+                if (!File.Exists(tempExe))
+                {
+                    MessageBox.Show("ดาวน์โหลดไฟล์อัปเดตไม่สำเร็จ กรุณาลองใหม่อีกครั้ง", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                string updaterBat = Path.Combine(appDir, "_run_update.bat");
+                string batContent =
+                    "@echo off\r\n" +
+                    "timeout /t 2 /nobreak > nul\r\n" +
+                    $"move /y \"{tempExe}\" \"{currentExePath}\" > nul\r\n" +
+                    $"start \"\" \"{currentExePath}\"\r\n" +
+                    "del \"%~f0\"\r\n";
+
+                File.WriteAllText(updaterBat, batContent, Encoding.Default);
+
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c \"\"{updaterBat}\"\"",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                Process.Start(psi);
+
+                ExitApplication();
+            }
+            catch (Exception ex)
+            {
+                if (isManual)
+                {
+                    MessageBox.Show($"เกิดข้อผิดพลาดในการอัปเดต: {ex.Message}", "Git Update Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
         }
     }
 }
